@@ -1,1 +1,445 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Recruitment AI Platform</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh; display: flex; justify-content: center; align-items: center; padding: 20px;
+    }
+    .container { background: #fff; border-radius: 20px; box-shadow: 0 20px 60px rgba(0,0,0,.3); max-width: 900px; width: 100%; overflow: hidden; }
+    .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: #fff; padding: 30px; text-align: center; }
+    .header h1 { font-size: 2em; margin-bottom: 10px; }
+    .content { padding: 40px; }
+    .step { display: none; }
+    .step.active { display: block; animation: fadeIn .5s; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+    .form-group { margin-bottom: 20px; }
+    label { display: block; margin-bottom: 8px; font-weight: 600; color: #333; }
+    input, textarea, select { width: 100%; padding: 12px; border: 2px solid #e0e0e0; border-radius: 8px; font-size: 14px; transition: border-color .3s; }
+    input:focus, textarea:focus, select:focus { outline: none; border-color: #667eea; }
+    textarea { resize: vertical; min-height: 100px; }
+    .skills-input { display: flex; gap: 10px; }
+    .skills-input input { flex: 1; }
+    .skills-input button { padding: 12px 20px; background: #667eea; color: #fff; border: none; border-radius: 8px; cursor: pointer; white-space: nowrap; }
+    .skills-tags { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+    .skill-tag { background: #e0e7ff; color: #667eea; padding: 6px 12px; border-radius: 20px; font-size: 14px; display: flex; align-items: center; gap: 8px; }
+    .skill-tag button { background: none; border: none; color: #667eea; cursor: pointer; font-size: 16px; padding: 0; }
+    .btn { padding: 14px 30px; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; transition: all .3s; }
+    .btn-primary { background: #667eea; color: #fff; }
+    .btn-primary:hover { background: #5568d3; transform: translateY(-2px); box-shadow: 0 5px 15px rgba(102,126,234,.4); }
+    .btn-secondary { background: #e0e0e0; color: #333; margin-right: 10px; }
+    .btn-secondary:hover { background: #d0d0d0; }
+    .btn-group { display: flex; gap: 10px; margin-top: 30px; }
+    .jd-preview { background: #f8f9fa; padding: 20px; border-radius: 8px; margin: 20px 0; white-space: pre-wrap; max-height: 400px; overflow-y: auto; }
+    .jd-actions { display: flex; gap: 10px; margin-top: 20px; flex-wrap: wrap; }
+    .loading { display: none; text-align: center; padding: 40px; }
+    .loading.active { display: block; }
+    .spinner { border: 4px solid #f3f3f3; border-top: 4px solid #667eea; border-radius: 50%; width: 50px; height: 50px; animation: spin 1s linear infinite; margin: 0 auto 20px; }
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    .alert { padding: 15px; border-radius: 8px; margin-bottom: 20px; }
+    .alert-success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+    .alert-error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+    .row { display: flex; gap: 20px; }
+    .col { flex: 1; }
+    .copy-btn { background: #28a745; color: #fff; }
+    .copy-btn:hover { background: #218838; }
+    #editableJD { width: 100%; min-height: 300px; padding: 15px; border: 2px solid #e0e0e0; border-radius: 8px; font-family: inherit; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>🚀 Recruitment AI Platform</h1>
+      <p>AI-Powered Job Description Generator</p>
+    </div>
+
+    <div class="content">
+      <!-- Step 1: Authentication -->
+      <div class="step active" id="step-auth">
+        <h2>Sign In / Sign Up</h2>
+        <div class="form-group">
+          <label>Email</label>
+          <input type="email" id="auth-email" placeholder="recruiter@company.com" required />
+        </div>
+        <div class="form-group">
+          <label>Password</label>
+          <input type="password" id="auth-password" placeholder="••••••••" required />
+        </div>
+        <div class="btn-group">
+          <button class="btn btn-primary" id="btn-signin">Sign In</button>
+          <button class="btn btn-secondary" id="btn-signup">Sign Up</button>
+        </div>
+        <div id="auth-message"></div>
+      </div>
+
+      <!-- Step 2: Company Info -->
+      <div class="step" id="step-company">
+        <h2>Company Information</h2>
+        <div class="form-group">
+          <label>Company Name *</label>
+          <input type="text" id="company-name" placeholder="Acme Corporation" required />
+        </div>
+        <div class="form-group">
+          <label>Your Name *</label>
+          <input type="text" id="recruiter-name" placeholder="John Doe" required />
+        </div>
+        <div class="form-group">
+          <label>Location</label>
+          <input type="text" id="company-location" placeholder="Pune, Maharashtra, India" />
+        </div>
+        <div class="form-group">
+          <label>LinkedIn URL</label>
+          <input type="url" id="linkedin-url" placeholder="https://linkedin.com/company/acme" />
+        </div>
+        <div class="form-group">
+          <label>Company Description</label>
+          <textarea id="company-desc" placeholder="Brief description of your company..."></textarea>
+        </div>
+        <div class="btn-group">
+          <button class="btn btn-primary" id="btn-create-company">Next</button>
+        </div>
+        <div id="company-message"></div>
+      </div>
+
+      <!-- Step 3: JD Creation -->
+      <div class="step" id="step-jd">
+        <h2>Create Job Description</h2>
+        <div class="form-group">
+          <label>Job Title *</label>
+          <input type="text" id="job-title" placeholder="Senior Software Engineer" required />
+        </div>
+        <div class="row">
+          <div class="col">
+            <div class="form-group">
+              <label>Min Experience (years)</label>
+              <input type="number" id="min-exp" placeholder="2" min="0" />
+            </div>
+          </div>
+          <div class="col">
+            <div class="form-group">
+              <label>Max Experience (years)</label>
+              <input type="number" id="max-exp" placeholder="5" min="0" />
+            </div>
+          </div>
+        </div>
+        <div class="row">
+          <div class="col">
+            <div class="form-group">
+              <label>Employment Type *</label>
+              <select id="employment-type">
+                <option value="Full-time">Full-time</option>
+                <option value="Part-time">Part-time</option>
+                <option value="Contract">Contract</option>
+                <option value="Internship">Internship</option>
+              </select>
+            </div>
+          </div>
+          <div class="col">
+            <div class="form-group">
+              <label>Work Mode *</label>
+              <select id="work-mode">
+                <option value="online">Remote</option>
+                <option value="offline">Office</option>
+                <option value="hybrid">Hybrid</option>
+              </select>
+            </div>
+          </div>
+        </div>
+        <div class="form-group">
+          <label>Location</label>
+          <input type="text" id="job-location" placeholder="Pune, India or Remote" />
+        </div>
+        <div class="form-group">
+          <label>Must-Have Skills</label>
+          <div class="skills-input">
+            <input type="text" id="skill-must" placeholder="e.g., Python, FastAPI" />
+            <button type="button" id="btn-add-must">Add</button>
+          </div>
+          <div class="skills-tags" id="skills-must-tags"></div>
+        </div>
+        <div class="form-group">
+          <label>Nice-to-Have Skills</label>
+          <div class="skills-input">
+            <input type="text" id="skill-nice" placeholder="e.g., Docker, AWS" />
+            <button type="button" id="btn-add-nice">Add</button>
+          </div>
+          <div class="skills-tags" id="skills-nice-tags"></div>
+        </div>
+        <div class="form-group">
+          <label>Additional Requirements</label>
+          <textarea id="requirements" placeholder="Describe any additional requirements, responsibilities, or qualifications..."></textarea>
+        </div>
+        <div class="btn-group">
+          <button class="btn btn-secondary" id="btn-back-company">Back</button>
+          <button class="btn btn-primary" id="btn-generate-jd">Generate JD</button>
+        </div>
+        <div id="jd-message"></div>
+      </div>
+
+      <!-- Step 4: JD Review -->
+      <div class="step" id="step-review">
+        <h2>Review Job Description</h2>
+        <div id="jd-preview-container">
+          <div class="jd-preview" id="jd-preview"></div>
+        </div>
+        <div class="jd-actions">
+          <button class="btn btn-primary copy-btn" id="btn-copy">✓ Done - Copy to Clipboard</button>
+          <button class="btn btn-secondary" id="btn-edit">✏️ Edit</button>
+          <button class="btn btn-secondary" id="btn-regenerate">🔄 Regenerate</button>
+          <button class="btn btn-secondary" id="btn-back-jd">← Back</button>
+        </div>
+        <div id="review-message"></div>
+      </div>
+
+      <!-- Loading State -->
+      <div class="loading" id="loading">
+        <div class="spinner"></div>
+        <p>AI is generating your job description...</p>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const API_BASE = 'http://localhost:8000';
+    let authToken = null;
+    let currentJobId = null;
+    let companyName = '';
+    let companyDesc = '';   // <-- NEW
+
+    const skillsMust = [];
+    const skillsNice = [];
+
+    // ---------- UI helpers ----------
+    function goToStep(stepId) {
+      document.querySelectorAll('.step').forEach(s => s.classList.remove('active'));
+      document.getElementById(stepId).classList.add('active');
+    }
+
+    function showLoading(show) {
+      document.getElementById('loading').classList.toggle('active', show);
+      document.querySelectorAll('.step').forEach(s => {
+        if (!s.id.includes('loading')) s.style.display = show ? 'none' : '';
+      });
+    }
+
+    function showMessage(elementId, message, isError=false) {
+      const el = document.getElementById(elementId);
+      el.innerHTML = `<div class="alert ${isError ? 'alert-error' : 'alert-success'}">${message}</div>`;
+      setTimeout(() => { if (el) el.innerHTML = ''; }, 5000);
+    }
+
+    function ensureAuthed() {
+      if (!authToken) {
+        showMessage('auth-message', 'Your session expired. Please sign in again.', true);
+        goToStep('step-auth');
+        return false;
+      }
+      return true;
+    }
+
+    async function apiFetch(path, { method='GET', headers={}, body=null, requireAuth=true } = {}) {
+      const finalHeaders = { ...headers };
+      if (requireAuth) {
+        if (!ensureAuthed()) throw new Error('Not authenticated');
+        finalHeaders['Authorization'] = `Bearer ${authToken}`;
+      }
+      if (body && !(body instanceof FormData)) {
+        finalHeaders['Content-Type'] = finalHeaders['Content-Type'] || 'application/json';
+        body = JSON.stringify(body);
+      }
+      const res = await fetch(`${API_BASE}${path}`, { method, headers: finalHeaders, body });
+      let data;
+      const text = await res.text();
+      try { data = text ? JSON.parse(text) : {}; } catch { data = { detail: text }; }
+      if (res.status === 401) {
+        showMessage('auth-message', data.detail || 'Unauthorized. Please sign in.', true);
+        goToStep('step-auth');
+        throw new Error('Unauthorized');
+      }
+      return { ok: res.ok, status: res.status, data };
+    }
+
+    // ---------- Auth ----------
+    async function signUp() {
+      const email = document.getElementById('auth-email').value.trim();
+      const password = document.getElementById('auth-password').value.trim();
+      if (!email || !password) return showMessage('auth-message','Please enter email and password', true);
+      const { ok, data } = await apiFetch('/auth/signup', { method: 'POST', requireAuth: false, body: { email, password } });
+      if (ok) showMessage('auth-message','Account created! Please sign in.'); else showMessage('auth-message', data.detail || 'Signup failed', true);
+    }
+
+    async function signIn() {
+      const email = document.getElementById('auth-email').value.trim();
+      const password = document.getElementById('auth-password').value.trim();
+      if (!email || !password) return showMessage('auth-message','Please enter email and password', true);
+      const { ok, data } = await apiFetch('/auth/signin', { method: 'POST', requireAuth: false, body: { email, password } });
+      if (ok) {
+        authToken = data.access_token;
+        try { localStorage.setItem('access_token', authToken); } catch {}
+        showMessage('auth-message','Signed in successfully!');
+        setTimeout(() => goToStep('step-company'), 600);
+      } else {
+        showMessage('auth-message', data.detail || 'Sign in failed', true);
+      }
+    }
+
+    // ---------- Company ----------
+    async function createCompany() {
+      if (!ensureAuthed()) return;
+      const company_name = document.getElementById('company-name').value.trim();
+      const recruiter_name = document.getElementById('recruiter-name').value.trim();
+      const location = document.getElementById('company-location').value.trim();
+      const linkedin_url = document.getElementById('linkedin-url').value.trim();
+      const description = document.getElementById('company-desc').value.trim();
+      if (!company_name || !recruiter_name) return showMessage('company-message','Company name and your name are required', true);
+      companyName = company_name;
+      companyDesc = description;
+      const { ok, data } = await apiFetch('/company/create', { method: 'POST', body: { company_name, recruiter_name, location, linkedin_url, description } });
+      if (ok) { showMessage('company-message','Company profile created!'); setTimeout(() => goToStep('step-jd'), 600); }
+      else { showMessage('company-message', data.detail || 'Failed to create company', true); }
+    }
+
+    // ---------- Skills helpers ----------
+    function addSkill(type) {
+      const inputId = type === 'must' ? 'skill-must' : 'skill-nice';
+      const containerId = type === 'must' ? 'skills-must-tags' : 'skills-nice-tags';
+      const arr = type === 'must' ? skillsMust : skillsNice;
+      const input = document.getElementById(inputId);
+      let raw = input.value.trim();
+      if (!raw) return;
+      // Split on comma to allow quick entry of multiple
+      const parts = raw.split(',').map(s => s.trim()).filter(Boolean);
+      let added = false;
+      parts.forEach(skill => {
+        const exists = arr.some(x => x.toLowerCase() === skill.toLowerCase());
+        if (!exists) { arr.push(skill); added = true; }
+      });
+      if (added) updateSkillTags(type);
+      input.value = '';
+    }
+
+    function removeSkill(type, skill) {
+      const arr = type === 'must' ? skillsMust : skillsNice;
+      const idx = arr.findIndex(s => s.toLowerCase() === skill.toLowerCase());
+      if (idx > -1) { arr.splice(idx, 1); updateSkillTags(type); }
+    }
+
+    function updateSkillTags(type) {
+      const containerId = type === 'must' ? 'skills-must-tags' : 'skills-nice-tags';
+      const arr = type === 'must' ? skillsMust : skillsNice;
+      const container = document.getElementById(containerId);
+      container.innerHTML = arr.map(skill => (
+        `<div class="skill-tag">${skill} <button type="button" onclick="removeSkill('${type}','${skill.replace(/'/g, "&#39;")}')">×</button></div>`
+      )).join('');
+    }
+
+    // ---------- JD ----------
+    async function generateJD() {
+      if (!ensureAuthed()) return;
+      const job_title = document.getElementById('job-title').value.trim();
+      const min_experience = parseFloat(document.getElementById('min-exp').value) || null;
+      const max_experience = parseFloat(document.getElementById('max-exp').value) || null;
+      const employment_type = document.getElementById('employment-type').value;
+      const work_mode = document.getElementById('work-mode').value; // online | offline | hybrid
+      const location = document.getElementById('job-location').value.trim();
+      const requirements = document.getElementById('requirements').value.trim();
+      if (!job_title) return showMessage('jd-message','Job title is required', true);
+      showLoading(true);
+      const payload = { job_title, min_experience, max_experience, company_name: companyName,company_description: companyDesc, employment_type, work_mode, location, skills_must_have: skillsMust, skills_nice_to_have: skillsNice, requirements: requirements || 'Standard requirements for the role' };
+      const { ok, data } = await apiFetch('/jd/create', { method: 'POST', body: payload });
+      showLoading(false);
+      if (ok) {
+        currentJobId = data.job_id;
+        document.getElementById('jd-preview').textContent = data.jd_text || '';
+        goToStep('step-review');
+      } else {
+        showMessage('jd-message', data.detail || 'Failed to generate JD', true);
+      }
+    }
+
+    async function regenerateJD() {
+      if (!ensureAuthed() || !currentJobId) return;
+      showLoading(true);
+      const { ok, data } = await apiFetch(`/jd/regenerate/${currentJobId}`, { method: 'POST' });
+      showLoading(false);
+      if (ok) {
+        document.getElementById('jd-preview').textContent = data.jd_text || '';
+        showMessage('review-message','JD regenerated successfully!');
+      } else {
+        showMessage('review-message', data.detail || 'Failed to regenerate JD', true);
+      }
+    }
+
+    function enableEdit() {
+      const preview = document.getElementById('jd-preview');
+      const currentText = preview.textContent;
+      preview.innerHTML = `<textarea id="editableJD">${currentText.replace(/</g,'&lt;')}</textarea>
+        <button class="btn btn-primary" id="btn-save-edit" style="margin-top: 15px;">Save Changes</button>
+        <button class="btn btn-secondary" id="btn-cancel-edit" style="margin-top: 15px;">Cancel</button>`;
+      document.getElementById('btn-save-edit').onclick = saveEdit;
+      document.getElementById('btn-cancel-edit').onclick = cancelEdit;
+    }
+
+    async function saveEdit() {
+      if (!ensureAuthed() || !currentJobId) return;
+      const editedText = document.getElementById('editableJD').value;
+      const qp = encodeURIComponent(editedText);
+      const { ok, data } = await apiFetch(`/jd/edit/${currentJobId}?jd_text=${qp}`, { method: 'PUT' });
+      if (ok) {
+        document.getElementById('jd-preview').textContent = editedText;
+        showMessage('review-message','JD updated successfully!');
+      } else {
+        showMessage('review-message', data.detail || 'Failed to update JD', true);
+      }
+    }
+
+    function cancelEdit() {
+      // Simply re-render the raw text inside the preview (keeps current textarea value)
+      const text = document.getElementById('editableJD').value;
+      document.getElementById('jd-preview').textContent = text;
+    }
+
+    async function copyToClipboard() {
+      const text = document.getElementById('jd-preview').textContent;
+      try {
+        await navigator.clipboard.writeText(text);
+        if (ensureAuthed() && currentJobId) {
+          await apiFetch(`/jd/finalize/${currentJobId}`, { method: 'POST' });
+        }
+        showMessage('review-message','✓ Job description copied to clipboard! You can now paste it on LinkedIn.');
+      } catch (err) {
+        showMessage('review-message', 'Failed to copy: ' + err.message, true);
+      }
+    }
+
+    // ---------- Wire up events ----------
+    document.getElementById('btn-signin').onclick = signIn;
+    document.getElementById('btn-signup').onclick = signUp;
+    document.getElementById('btn-create-company').onclick = createCompany;
+    document.getElementById('btn-back-company').onclick = () => goToStep('step-company');
+    document.getElementById('btn-generate-jd').onclick = generateJD;
+    document.getElementById('btn-regenerate').onclick = regenerateJD;
+    document.getElementById('btn-edit').onclick = enableEdit;
+    document.getElementById('btn-back-jd').onclick = () => goToStep('step-jd');
+    document.getElementById('btn-copy').onclick = copyToClipboard;
+    document.getElementById('btn-add-must').onclick = () => addSkill('must');
+    document.getElementById('btn-add-nice').onclick = () => addSkill('nice');
+
+    // Enter to add skills
+    document.addEventListener('DOMContentLoaded', () => {
+      const must = document.getElementById('skill-must');
+      const nice = document.getElementById('skill-nice');
+      if (must) must.addEventListener('keypress', e => { if (e.key === 'Enter') { e.preventDefault(); addSkill('must'); } });
+      if (nice) nice.addEventListener('keypress', e => { if (e.key === 'Enter') { e.preventDefault(); addSkill('nice'); } });
+      // Restore token if available
+      try { const t = localStorage.getItem('access_token'); if (t) { authToken = t; } } catch {}
+    });
+  </script>
+</body>
+</html>
 
