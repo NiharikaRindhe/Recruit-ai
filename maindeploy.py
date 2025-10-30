@@ -256,6 +256,51 @@ async def signin(request: SignInRequest):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
     except Exception:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
+    
+@app.get("/me")
+async def get_me(current_user: UserIdentity = Depends(get_current_user)):
+        """
+        Return current user + recruiter + company (if any).
+        Used by the frontend to decide whether to show 'create company'.
+        """
+        # is there a recruiter row for this user?
+        recruiter_resp = (
+            supabase.table("recruiters")
+            .select("user_id, full_name, company_id, company_email")
+            .eq("user_id", current_user.user_id)
+            .execute()
+        )
+
+        if recruiter_resp.data:
+            recruiter = recruiter_resp.data[0]
+            company = None
+            company_id = recruiter.get("company_id")
+
+            if company_id:
+                company_resp = (
+                    supabase.table("companies")
+                    .select("company_id, company_name, description, location, linkedin_url")
+                    .eq("company_id", company_id)
+                    .execute()
+                )
+                if company_resp.data:
+                    company = company_resp.data[0]
+
+            return {
+                "user": {"id": current_user.user_id, "email": current_user.email},
+                "recruiter": recruiter,
+                "company": company,
+                "has_company": bool(company),
+            }
+
+        # no recruiter yet -> first time user
+        return {
+            "user": {"id": current_user.user_id, "email": current_user.email},
+            "recruiter": None,
+            "company": None,
+            "has_company": False,
+        }
+
 
 @app.post("/company/create")
 async def create_company(request: CompanyRequest, current_user: UserIdentity = Depends(get_current_user)):
