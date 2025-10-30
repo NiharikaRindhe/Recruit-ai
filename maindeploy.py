@@ -205,7 +205,7 @@ Include “Tools & Technologies” only if the skills contain concrete technolog
 (3–5 sentences that weave in Work Mode, Location, Employment Type, and Experience Required.)
 
 **Key Responsibilities**
-- 10–14 bullets tailored to the role and Additional Requirements.
+- 7–9 bullets tailored to the role and Additional Requirements.
 
 **Required Qualifications**
 - Bullets that reflect Experience Required and all Must-Have Skills.
@@ -215,9 +215,6 @@ Include “Tools & Technologies” only if the skills contain concrete technolog
 
 **Tools & Technologies** (optional)
 - Comma-separated list from the skills above (only if meaningful).
-
-**Equal Opportunity**
-- We’re an equal-opportunity employer and welcome candidates from all backgrounds.
 
 Formatting rules:
 - No preamble, no code fences, no instructions—only the final JD.
