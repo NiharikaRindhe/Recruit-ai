@@ -89,6 +89,10 @@ class JDCreateRequest(BaseModel):
     location: Optional[str] = None
 
 
+class JDIngestText(BaseModel):
+    jd_text: str
+
+
 class JDIngestAnswer(BaseModel):
     original_jd_text: str
     parsed: Dict[str, Any]
@@ -98,7 +102,6 @@ class JDIngestAnswer(BaseModel):
 class UserIdentity(BaseModel):
     user_id: str
     email: str
-
 
 # ---------------------------------------------------------------------------
 # Auth helpers
@@ -804,5 +807,6 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+
 
 
