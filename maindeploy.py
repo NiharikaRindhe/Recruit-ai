@@ -619,24 +619,6 @@ async def edit_jd(job_id: str, jd_text: str, current_user: UserIdentity = Depend
         raise HTTPException(status_code=400, detail=f"Error updating JD: {e}")
 
 
-# ---------- jd/finalize ----------
-@app.post("/jd/finalize/{job_id}")
-async def finalize_jd(job_id: str, current_user: UserIdentity = Depends(get_current_user)):
-    try:
-        result = (
-            supabase.table("jobs")
-            .update({"status": "published"})
-            .eq("job_id", job_id)
-            .eq("created_by", current_user.user_id)
-            .execute()
-        )
-        if not result.data:
-            raise HTTPException(status_code=404, detail="Job not found or unauthorized")
-        return {"message": "JD finalized and published", "job_id": job_id}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error finalizing JD: {e}")
-
-
 # ---------- jobs/my-jobs ----------
 @app.get("/jobs/my-jobs")
 async def get_my_jobs(current_user: UserIdentity = Depends(get_current_user)):
@@ -736,21 +718,81 @@ async def ingest_jd_text(
         "job": job_res.data[0],
     }
 
-
-# ---------- list cloud/local models (optional) ----------
-@app.get("/ollama/tags")
-async def list_ollama_tags():
-    is_cloud = _is_cloud_host(OLLAMA_BASE_URL)
-    url = f"{OLLAMA_BASE_URL.rstrip('/')}/tags"
-    headers = {}
-    if is_cloud and OLLAMA_API_KEY:
-        headers["Authorization"] = f"Bearer {OLLAMA_API_KEY}"
+@app.post("/jd/finalize/{job_id}")
+async def finalize_jd(job_id: str, current_user: UserIdentity = Depends(get_current_user)):
     try:
-        r = requests.get(url, headers=headers, timeout=30)
-        r.raise_for_status()
-        return r.json()
-    except requests.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch tags: {e}")
+        result = (
+            supabase.table("jobs")
+            .update({"status": "published"})
+            .eq("job_id", job_id)
+            .eq("created_by", current_user.user_id)
+            .execute()
+        )
+        if not result.data:
+            raise HTTPException(status_code=404, detail="Job not found or unauthorized")
+        return {"message": "JD finalized and published", "job_id": job_id}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Error finalizing JD: {e}")
+
+@app.post("/jd/ingest-answer")
+async def ingest_answer(
+    payload: JDIngestAnswer,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    # still need a company
+    recruiter_resp = (
+        supabase.table("recruiters")
+        .select("company_id")
+        .eq("user_id", current_user.user_id)
+        .execute()
+    )
+    if not recruiter_resp.data:
+        return {
+            "status": "needs_company",
+            "message": "Please create your company profile first.",
+        }
+
+    company_id = recruiter_resp.data[0]["company_id"]
+
+    parsed = dict(payload.parsed or {})
+    # merge answers
+    for k, v in (payload.answers or {}).items():
+        parsed[k] = v
+
+    # re-check missing
+    missing = _detect_missing_fields(parsed)
+    if missing:
+        return {
+            "status": "needs_input",
+            "parsed": parsed,
+            "questions": missing,
+        }
+
+    # normalize
+    work_mode = normalize_work_mode(parsed.get("work_mode"))
+    employment_type = normalize_employment_type(parsed.get("employment_type"))
+
+    job_payload = {
+        "company_id": company_id,
+        "created_by": current_user.user_id,
+        "role": parsed.get("job_title") or "Untitled Role",
+        "location": parsed.get("location"),
+        "employment_type": employment_type,
+        "work_mode": work_mode,
+        "min_years": parsed.get("min_experience"),
+        "max_years": parsed.get("max_experience"),
+        "skills_must_have": json.dumps(parsed.get("skills_must_have") or []),
+        "skills_nice_to_have": json.dumps(parsed.get("skills_nice_to_have") or []),
+        "jd_text": parsed.get("jd_text") or payload.original_jd_text,
+        "status": "draft",
+    }
+
+    job_res = supabase.table("jobs").insert(job_payload).execute()
+    return {
+        "status": "ok",
+        "job_id": job_res.data[0]["job_id"],
+        "job": job_res.data[0],
+    }
 
 
 # ---------------------------------------------------------------------------
