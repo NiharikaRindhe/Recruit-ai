@@ -4,11 +4,7 @@ import json
 from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, Depends, HTTPException, status
-from fastapi.middlewaclass JDIngestAnswer(BaseModel):
-    original_jd_text: str
-    parsed: Dict[str, Any]
-    answers: Dict[str, Any]
-re.cors import CORSMiddleware
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr, Field
@@ -808,4 +804,5 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
+
 
