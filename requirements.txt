@@ -5,3 +5,11 @@ python-dotenv==1.0.0
 pydantic[email]==2.5.0
 PyJWT==2.8.0
 requests==2.31.0
+email-validator==2.3.0
+
+# Supabase SDKs
+storage3==2.23.2
+
+# File uploads + PDF text extraction
+python-multipart==0.0.20
+pymupdf==1.24.10
