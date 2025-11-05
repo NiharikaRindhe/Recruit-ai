@@ -1,15 +1,21 @@
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
+
+# Supabase SDK (keep your pinned version)
 supabase==2.0.3
+# ✅ Compatible with supabase 2.0.3
+storage3==0.6.6
+
 python-dotenv==1.0.0
-pydantic[email]==2.5.0
-PyJWT==2.8.0
 requests==2.31.0
+PyJWT==2.8.0
+
+# Pydantic v2 with email extras
+pydantic[email]==2.5.0
 email-validator==2.3.0
 
-# Supabase SDKs
-storage3==2.23.2
-
-# File uploads + PDF text extraction
+# Needed for UploadFile / multipart form-data
 python-multipart==0.0.20
-pymupdf==1.24.10
+
+# PDF extraction (imported as "fitz")
+PyMuPDF==1.24.10
