@@ -21,6 +21,43 @@ try:
 except Exception:  # older SDKs won't have it
     UploadFileOptions = None
 
+# secure hashing (recommended)
+# -------- Password hashing (Passlib preferred; safe fallback) --------
+try:
+    from passlib.context import CryptContext  # pip install passlib[bcrypt]
+    pwd_context = CryptContext(schemes=["bcrypt_sha256"], deprecated="auto")
+
+    def _hash_password(p: str) -> str:
+        return pwd_context.hash(p)
+
+    def _verify_password(p: str, h: str) -> bool:
+        return pwd_context.verify(p, h)
+
+except Exception:
+    # Fallback: salted sha256 (only if passlib isn't installed) – less secure
+    import os, base64, hashlib
+
+    def _hash_password(p: str) -> str:
+        salt = os.urandom(16)
+        h = hashlib.sha256(salt + p.encode("utf-8")).digest()
+        return "sha256$" + base64.b64encode(salt + h).decode("utf-8")
+
+    def _verify_password(p: str, h: str) -> bool:
+        if not h.startswith("sha256$"):
+            return False
+        raw = base64.b64decode(h.split("sha256$", 1)[1].encode("utf-8"))
+        salt, digest = raw[:16], raw[16:]
+        return hashlib.sha256(salt + p.encode("utf-8")).digest() == digest
+
+from passlib.context import CryptContext
+
+# one global password-hashing context (removes bcrypt 72-byte limit)
+pwd_context = CryptContext(
+    schemes=["bcrypt_sha256"],
+    deprecated="auto",
+)
+
+
 # ---------------------------------------------------------------------------
 # env
 # ---------------------------------------------------------------------------
@@ -108,6 +145,25 @@ class ParseOneRequest(BaseModel):
     storage_key: Optional[str] = None
     file_hash: Optional[str] = None
     email_hint: Optional[str] = None  # optional override
+
+class InterviewerCreate(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
+    is_active: Optional[bool] = True
+
+class InterviewerUpdate(BaseModel):
+    name: Optional[str] = None
+    email: Optional[EmailStr] = None
+    password: Optional[str] = None
+    is_active: Optional[bool] = None
+
+class InterviewerOut(BaseModel):
+    interviewer_id: str
+    name: str
+    email: EmailStr
+    company_id: Optional[str] = None
+    is_active: bool = True
 
 # ---------------------------------------------------------------------------
 # Auth helpers
@@ -407,6 +463,17 @@ def _get_job_owned(job_id: str, user: UserIdentity) -> dict:
     if not job:
         raise HTTPException(404, "Job not found or unauthorized")
     return job
+
+def _get_company_id_for_user(user: UserIdentity) -> Optional[str]:
+    rec = (
+        supabase.table("recruiters")
+        .select("company_id")
+        .eq("user_id", user.user_id)
+        .limit(1)
+        .execute()
+        .data
+    )
+    return rec[0]["company_id"] if rec else None
 
 # ---------------------------------------------------------------------------
 # routes (YOUR ORIGINAL ROUTES — UNCHANGED)
@@ -934,9 +1001,6 @@ Return ONLY Markdown with these sections (use the exact headings):
 ### Risk Flags
 - Any red flags (employment gaps, very short stints, mismatched titles, etc.). If none, write "None noted."
 
-### Suggested Interview Questions
-- 3–5 targeted questions to validate skills/gaps.
-
 ### Scores
 - Skill match: {skill_score} / 100
 - Experience match: {exp_score} / 100
@@ -1179,7 +1243,7 @@ async def parse_pending(
         supabase.table("resume_uploads")
         .select("storage_key, filename")
         .eq("job_id", job_id)
-        .is_("parsed_at", None)  # supabase-py supports .is_ for IS NULL
+        .is_("parsed_at", "null")  # supabase-py supports .is_ for IS NULL
         .limit(limit)
         .execute()
         .data
@@ -1508,6 +1572,194 @@ async def list_resumes(
         "next_offset": next_offset,
         "rows": rows,
     }
+
+# ===================== INTERVIEWERS CRUD =====================
+
+# Create
+@app.post("/interviewers", response_model=InterviewerOut)
+async def create_interviewer(
+    body: InterviewerCreate,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    company_id = _get_company_id_for_user(current_user)
+    if not company_id:
+        raise HTTPException(400, "Please create company profile first")
+
+    # unique email constraint handling
+    existing = (
+        supabase.table("interviewers")
+        .select("interviewer_id")
+        .eq("email", body.email.lower())
+        .eq("company_id", company_id)
+        .limit(1)
+        .execute()
+        .data
+    )
+    if existing:
+        raise HTTPException(status_code=409, detail="Interviewer with this email already exists")
+
+    insert = {
+        "name": body.name.strip(),
+        "email": body.email.lower(),
+        "password_hash": _hash_password(body.password),
+        "company_id": company_id,
+        "created_by": current_user.user_id,
+        "is_active": bool(body.is_active),
+    }
+    res = supabase.table("interviewers").insert(insert).execute()
+    row = res.data[0]
+    return {
+        "interviewer_id": row["interviewer_id"],
+        "name": row["name"],
+        "email": row["email"],
+        "company_id": row.get("company_id"),
+        "is_active": row.get("is_active", True),
+    }
+
+@app.get("/interviewers", response_model=List[InterviewerOut])
+async def list_interviewers(
+    q: Optional[str] = Query(None, description="search by name/email"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    company_id = _get_company_id_for_user(current_user)
+    if not company_id:
+        raise HTTPException(400, "Please create company profile first")
+
+    query = (
+        supabase.table("interviewers")
+        .select("interviewer_id, name, email, company_id, is_active")
+        .eq("company_id", company_id)
+        .eq("is_active", True)
+    )
+
+    # Optional order if column exists
+    try:
+        query = query.order("created_at", desc=True)
+    except Exception:
+        pass
+
+    if q:
+        # Search both name and email (PostgREST OR syntax)
+        try:
+            query = query.or_(f"email.ilike.%{q}%,name.ilike.%{q}%")
+        except Exception:
+            # Minimal fallback: filter by email only
+            query = query.filter("email", "ilike", f"%{q}%")
+
+    end = offset + limit - 1
+    rows = query.range(offset, end).execute().data or []
+    return [
+        {
+            "interviewer_id": r["interviewer_id"],
+            "name": r["name"],
+            "email": r["email"],
+            "company_id": r.get("company_id"),
+            "is_active": r.get("is_active", True),
+        }
+        for r in rows
+    ]
+
+# Read one
+@app.get("/interviewers/{interviewer_id}", response_model=InterviewerOut)
+async def get_interviewer(
+    interviewer_id: str,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    company_id = _get_company_id_for_user(current_user)
+    row = (
+        supabase.table("interviewers")
+        .select("interviewer_id, name, email, company_id, is_active")
+        .eq("interviewer_id", interviewer_id)
+        .eq("company_id", company_id)
+        .single()
+        .execute()
+        .data
+    )
+    if not row:
+        raise HTTPException(404, "Interviewer not found")
+    return row
+
+
+# Update
+@app.put("/interviewers/{interviewer_id}", response_model=InterviewerOut)
+async def update_interviewer(
+    interviewer_id: str,
+    body: InterviewerUpdate,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    company_id = _get_company_id_for_user(current_user)
+
+    update_data: Dict[str, Any] = {}
+    if body.name is not None:
+        update_data["name"] = body.name.strip()
+    if body.email is not None:
+        update_data["email"] = body.email.lower()
+    if body.password is not None:
+        update_data["password_hash"] = _hash_password(body.password)
+    if body.is_active is not None:
+        update_data["is_active"] = bool(body.is_active)
+
+    if not update_data:
+        raise HTTPException(400, "Nothing to update")
+
+    res = (
+        supabase.table("interviewers")
+        .update(update_data)
+        .eq("interviewer_id", interviewer_id)
+        .eq("company_id", company_id)
+        .execute()
+        .data
+    )
+    if not res:
+        raise HTTPException(404, "Interviewer not found or unauthorized")
+    row = res[0]
+    return {
+        "interviewer_id": row["interviewer_id"],
+        "name": row["name"],
+        "email": row["email"],
+        "company_id": row.get("company_id"),
+        "is_active": row.get("is_active", True),
+    }
+
+
+# Delete (soft by default; hard with ?hard=true)
+@app.delete("/interviewers/{interviewer_id}")
+async def delete_interviewer(
+    interviewer_id: str,
+    hard: bool = Query(False, description="set true to hard delete"),
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    company_id = _get_company_id_for_user(current_user)
+
+    if hard:
+        res = (
+            supabase.table("interviewers")
+            .delete()
+            .eq("interviewer_id", interviewer_id)
+            .eq("company_id", company_id)
+            .execute()
+            .data
+        )
+        if not res:
+            raise HTTPException(404, "Interviewer not found or unauthorized")
+        return {"message": "Interviewer deleted", "interviewer_id": interviewer_id, "hard": True}
+
+    # soft delete
+    res = (
+        supabase.table("interviewers")
+        .update({"is_active": False})
+        .eq("interviewer_id", interviewer_id)
+        .eq("company_id", company_id)
+        .execute()
+        .data
+    )
+    if not res:
+        raise HTTPException(404, "Interviewer not found or unauthorized")
+    return {"message": "Interviewer deactivated", "interviewer_id": interviewer_id, "hard": False}
+# =================== end INTERVIEWERS CRUD ===================
+
 # ---------------------------------------------------------------------------
 # run (local)
 # ---------------------------------------------------------------------------
