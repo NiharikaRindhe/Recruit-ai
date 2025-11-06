@@ -109,6 +109,8 @@ class ParseOneRequest(BaseModel):
     file_hash: Optional[str] = None
     email_hint: Optional[str] = None  # optional override
 
+class JDEditBody(BaseModel):
+    jd_text: str
 # ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------
@@ -326,7 +328,7 @@ def _extract_fields_from_jd_text(jd_text: str) -> Dict[str, Any]:
             work_mode = "remote"
         elif re.search(r"(?i)\bhybrid\b", text):
             work_mode = "hybrid"
-        elif re.search(r"(?i)\bonsite|on-site|office\b", text):
+        elif re.search(r"(?i)\b(?:onsite|on-site|office)\b", text):
             work_mode = "onsite"
 
     # experience
@@ -614,18 +616,18 @@ async def regenerate_jd(job_id: str, current_user: UserIdentity = Depends(get_cu
 
 # ---------- jd/edit ----------
 @app.put("/jd/edit/{job_id}")
-async def edit_jd(job_id: str, jd_text: str, current_user: UserIdentity = Depends(get_current_user)):
+async def edit_jd(job_id: str, body: JDEditBody, current_user: UserIdentity = Depends(get_current_user)):
     try:
         result = (
             supabase.table("jobs")
-            .update({"jd_text": jd_text})
+            .update({"jd_text": body.jd_text})
             .eq("job_id", job_id)
             .eq("created_by", current_user.user_id)
             .execute()
         )
         if not result.data:
             raise HTTPException(status_code=404, detail="Job not found or unauthorized")
-        return {"message": "JD updated successfully", "job_id": job_id, "jd_text": jd_text}
+        return {"message": "JD updated successfully", "job_id": job_id, "jd_text": body.jd_text}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error updating JD: {e}")
 
@@ -914,12 +916,96 @@ EXTRACT_PROMPT = (
     "No comments, no trailing commas.\n"
     "RESUME TEXT:\n{resume_text}"
 )
+# --- Rich JD↔︎Resume analysis (markdown) ---
+ANALYSIS_PROMPT = """
+You are a technical recruiter assistant. Compare the JOB DESCRIPTION and the CANDIDATE RESUME and write a concise analysis in Markdown.
 
-SUMMARY_PROMPT = (
-    "Write a <=100-word hiring summary stating whether {name} fits the role \"{role}\". "
-    "Mention verified skills ({skills}) and total experience ({yoe} years). "
-    "Conclude with the JD match score: {score}. Plain text only. JD: {jd}"
-)
+Return ONLY Markdown with these sections (use the exact headings):
+### Verdict
+(one of: Strong Fit, Fit, Borderline, Not a Fit) with a one-sentence rationale.
+
+### Key Matches
+- Map must-have requirements to concrete evidence from the resume (role, dates, tech).
+
+### Gaps
+- List missing or weak items; mark each as **major** or **minor**.
+
+### Experience Check
+- Years parsed: {yoe} vs JD min: {miny} / max: {maxy}. Brief comment.
+
+### Risk Flags
+- Any red flags (employment gaps, very short stints, mismatched titles, etc.). If none, write "None noted."
+
+### Suggested Interview Questions
+- 3–5 targeted questions to validate skills/gaps.
+
+### Scores
+- Skill match: {skill_score} / 100
+- Experience match: {exp_score} / 100
+- Overall JD match: {overall_score} / 100
+
+### Recommendation
+- One of: Proceed to phone screen / Proceed to technical screen / Hold for backup / Reject (with reason).
+
+DATA:
+JD TITLE: {role}
+MUST-HAVES: {must}
+NICE-TO-HAVES: {nice}
+
+JOB DESCRIPTION (truncated):
+{jd}
+
+CANDIDATE (parsed & truncated):
+{cand}
+
+Only use information present above. Be specific, avoid fluff. Keep total under ~250 words.
+""".strip()
+
+def generate_resume_analysis(
+    candidate: dict,
+    meta: dict,
+    jd_text: str,
+    role: Optional[str],
+    must: List[str],
+    nice: List[str],
+    miny: Optional[float],
+    maxy: Optional[float],
+) -> str:
+    # compact the candidate payload to keep prompt small
+    cand_compact = {
+        "name": candidate.get("full_name")
+                or f"{candidate.get('first_name','')} {candidate.get('last_name','')}".strip(),
+        "location": candidate.get("location"),
+        "links": candidate.get("links"),
+        "skills": candidate.get("skills"),
+        "experience": (candidate.get("experience") or [])[:5],
+        "education": (candidate.get("education") or [])[:3],
+        "projects": (candidate.get("projects") or [])[:3],
+        "certifications": candidate.get("certifications") or [],
+    }
+
+    overall = round(
+        0.65 * float(meta.get("skill_match_score", 0)) +
+        0.35 * float(meta.get("experience_match_score", 0)), 2
+    )
+
+    prompt = ANALYSIS_PROMPT.format(
+        role=role or "Software Engineer",
+        must=", ".join(must or []),
+        nice=", ".join(nice or []),
+        jd=(jd_text or "")[:2000],
+        cand=json.dumps(cand_compact, ensure_ascii=False)[:2500],
+        yoe=meta.get("total_experience_years", "n/a"),
+        miny=miny if miny is not None else "n/a",
+        maxy=maxy if maxy is not None else "n/a",
+        skill_score=meta.get("skill_match_score", 0),
+        exp_score=meta.get("experience_match_score", 0),
+        overall_score=overall,
+    )
+    try:
+        return _ollama_generate(prompt).strip()[:3000]
+    except Exception:
+        return "Analysis unavailable."
 
 # JSON tidying for slightly-invalid LLM JSON
 def _json_fragment(s: str) -> str:
@@ -974,20 +1060,6 @@ def parse_resume_structured(resume_text: str) -> dict:
     data["skills"] = _normalize_skills_block(data.get("skills") or {})
     return data
 
-def generate_resume_summary(candidate: dict, meta: dict, jd_text: str, role: str, score: float) -> str:
-    try:
-        name = (
-            candidate.get("full_name")
-            or (candidate.get("first_name") or "") + " " + (candidate.get("last_name") or "")
-        ).strip() or "Candidate"
-        top_sk = ", ".join((meta.get("top_matched_skills") or [])[:6]) or "n/a"
-        yoe = meta.get("total_experience_years", "n/a")
-        prompt = SUMMARY_PROMPT.format(
-            name=name, role=role or "Software Engineer", skills=top_sk, yoe=yoe, score=score, jd=(jd_text or "")[:1500]
-        )
-        return _ollama_generate(prompt).strip()[:800]
-    except Exception:
-        return "Concise fit summary unavailable."
 # ====== end LLM helpers block ======
 
 def _safe_json_list(x) -> List[str]:
@@ -1181,15 +1253,22 @@ def _insert_or_update_resume(job: dict, pdf_text: str, email_hint: Optional[str]
     ).execute()
     cand_row = supabase.table("candidates").select("candidate_id").eq("email", email).execute().data
     candidate_id = cand_row and cand_row[0].get("candidate_id")
+    # gather job skill lists in Python form
+    must = _safe_json_list(job.get("skills_must_have"))
+    nice = _safe_json_list(job.get("skills_nice_to_have"))
 
-    # ---- NEW: AI summary (uses your JD text + your meta/scores) ----
-    ai_sum = generate_resume_summary(
+    # ... after you compute meta/jd_match and cand ...
+    ai_analysis = generate_resume_analysis(
         cand,
-        {**meta, "primary_role": job.get("role")},
+        meta,
         job.get("jd_text") or "",
         job.get("role"),
-        jd_match,
+        must,
+        nice,
+        job.get("min_years"),
+        job.get("max_years"),
     )
+
 
     # ---- upsert resume row (unique: job_id + email) ----
     supabase.table("resumes").upsert(
@@ -1197,7 +1276,7 @@ def _insert_or_update_resume(job: dict, pdf_text: str, email_hint: Optional[str]
             "job_id": job["job_id"],
             "candidate_id": candidate_id,
             "email": email,
-            "status": "PENDING",
+            "status": "PARSED",
 
             # structured fields from parser
             "first_name": cand.get("first_name"),
@@ -1216,7 +1295,7 @@ def _insert_or_update_resume(job: dict, pdf_text: str, email_hint: Optional[str]
             "meta": meta,
             "raw_text": pdf_text,
             "role": job.get("role"),
-            "ai_summary": ai_sum,
+            "ai_summary": ai_analysis,
             "jd_match_score": jd_match,
             "skill_match_score": meta.get("skill_match_score"),
             "experience_match_score": meta.get("experience_match_score"),
@@ -1253,18 +1332,37 @@ async def rescore_existing(job_id: str, current_user: UserIdentity = Depends(get
         .data
         or []
     )
+    updated = 0
     for r in res:
         scored = _score(r.get("raw_text") or "", must, nice, job.get("min_years"), job.get("max_years"))
         meta = scored["meta"]; jd_match = scored["jd_match_score"]
+
+        # reparse candidate (small cost, keeps analysis fresh)
+        cand = parse_resume_structured(r.get("raw_text") or "")
+        ai_analysis = generate_resume_analysis(
+            cand,
+            meta,
+            job.get("jd_text") or "",
+            job.get("role"),
+            must,
+            nice,
+            job.get("min_years"),
+            job.get("max_years"),
+        )
+
         supabase.table("resumes").update(
             {
                 "jd_match_score": jd_match,
                 "skill_match_score": meta.get("skill_match_score"),
                 "experience_match_score": meta.get("experience_match_score"),
                 "meta": meta,
+                "ai_summary": ai_analysis,   # keep UI up to date
             }
         ).eq("resume_id", r["resume_id"]).execute()
-    return {"status": "ok", "rescored": len(res)}
+        updated += 1
+
+    return {"status": "ok", "rescored": updated}
+
 
 @app.post("/storage/cleanup")
 async def cleanup(current_user: UserIdentity = Depends(get_current_user)):
