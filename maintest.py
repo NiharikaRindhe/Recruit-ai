@@ -109,8 +109,6 @@ class ParseOneRequest(BaseModel):
     file_hash: Optional[str] = None
     email_hint: Optional[str] = None  # optional override
 
-class JDEditBody(BaseModel):
-    jd_text: str
 # ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------
@@ -616,18 +614,18 @@ async def regenerate_jd(job_id: str, current_user: UserIdentity = Depends(get_cu
 
 # ---------- jd/edit ----------
 @app.put("/jd/edit/{job_id}")
-async def edit_jd(job_id: str, body: JDEditBody, current_user: UserIdentity = Depends(get_current_user)):
+async def edit_jd(job_id: str, jd_text: str, current_user: UserIdentity = Depends(get_current_user)):
     try:
         result = (
             supabase.table("jobs")
-            .update({"jd_text": body.jd_text})
+            .update({"jd_text": jd_text})
             .eq("job_id", job_id)
             .eq("created_by", current_user.user_id)
             .execute()
         )
         if not result.data:
             raise HTTPException(status_code=404, detail="Job not found or unauthorized")
-        return {"message": "JD updated successfully", "job_id": job_id, "jd_text": body.jd_text}
+        return {"message": "JD updated successfully", "job_id": job_id, "jd_text": jd_text}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error updating JD: {e}")
 
