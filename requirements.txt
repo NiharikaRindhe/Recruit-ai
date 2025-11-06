@@ -18,3 +18,4 @@ python-multipart==0.0.20
 
 # PDF text extraction (imported as "fitz")
 PyMuPDF==1.24.10
+passlib[bcrypt]==1.7.4
