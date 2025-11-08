@@ -49,15 +49,6 @@ except Exception:
         salt, digest = raw[:16], raw[16:]
         return hashlib.sha256(salt + p.encode("utf-8")).digest() == digest
 
-from passlib.context import CryptContext
-
-# one global password-hashing context (removes bcrypt 72-byte limit)
-pwd_context = CryptContext(
-    schemes=["bcrypt_sha256"],
-    deprecated="auto",
-)
-
-
 # ---------------------------------------------------------------------------
 # env
 # ---------------------------------------------------------------------------
