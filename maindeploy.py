@@ -1677,7 +1677,6 @@ async def list_interviewers(
         supabase.table("interviewers")
         .select("interviewer_id, name, email, company_id, is_active")
         .eq("company_id", company_id)
-        .eq("is_active", True)
     )
 
     # Optional order if column exists
@@ -1991,4 +1990,3 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
-
