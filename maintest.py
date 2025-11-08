@@ -49,15 +49,6 @@ except Exception:
         salt, digest = raw[:16], raw[16:]
         return hashlib.sha256(salt + p.encode("utf-8")).digest() == digest
 
-from passlib.context import CryptContext
-
-# one global password-hashing context (removes bcrypt 72-byte limit)
-pwd_context = CryptContext(
-    schemes=["bcrypt_sha256"],
-    deprecated="auto",
-)
-
-
 # ---------------------------------------------------------------------------
 # env
 # ---------------------------------------------------------------------------
@@ -85,6 +76,8 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in environment")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+INVITE_REDIRECT = os.getenv("INTERVIEWER_INVITE_REDIRECT", "http://localhost:3000/set-password")
+RESET_REDIRECT  = os.getenv("PASSWORD_RESET_REDIRECT", "http://localhost:3000/reset")
 # ---------- NEW: storage + TTL settings ----------
 RESUME_BUCKET = os.getenv("RESUME_BUCKET", "resumes")
 RESUME_TTL_HOURS = int(os.getenv("RESUME_TTL_HOURS", "36"))
@@ -146,17 +139,18 @@ class ParseOneRequest(BaseModel):
     file_hash: Optional[str] = None
     email_hint: Optional[str] = None  # optional override
 
-class InterviewerCreate(BaseModel):
+class InterviewerInvite(BaseModel):
     name: str
     email: EmailStr
-    password: str
-    is_active: Optional[bool] = True
+    is_active: Optional[bool] = True  # default True
 
 class InterviewerUpdate(BaseModel):
     name: Optional[str] = None
     email: Optional[EmailStr] = None
-    password: Optional[str] = None
     is_active: Optional[bool] = None
+
+class SendResetOut(BaseModel):
+    action_link: str  # helpful in dev; in prod you’ll email it, but still return it for UI fallback
 
 class InterviewerOut(BaseModel):
     interviewer_id: str
@@ -164,6 +158,17 @@ class InterviewerOut(BaseModel):
     email: EmailStr
     company_id: Optional[str] = None
     is_active: bool = True
+
+# ---- Pydantic for interviewer auth ----
+class InterviewerSignIn(BaseModel):
+    email: EmailStr
+    password: str
+
+class InterviewerSessionOut(BaseModel):
+    access_token: str
+    refresh_token: str
+    user: Dict[str, Any]
+    interviewer: Dict[str, Any]
 
 # ---------------------------------------------------------------------------
 # Auth helpers
@@ -1366,6 +1371,19 @@ def _insert_or_update_resume(job: dict, pdf_text: str, email_hint: Optional[str]
         on_conflict="job_id,email",
     ).execute()
 
+def _ensure_company(user: UserIdentity) -> Dict[str, Any]:
+    rec = (
+        supabase.table("recruiters")
+        .select("company_id")
+        .eq("user_id", user.user_id)
+        .single()
+        .execute()
+        .data
+    )
+    if not rec:
+        raise HTTPException(400, "Please create company profile first")
+    return rec
+
 @app.get("/jobs/{job_id}/ranked")
 async def ranked(job_id: str, limit: int = Query(50, ge=1, le=200), current_user: UserIdentity = Depends(get_current_user)):
     _ = _get_job_owned(job_id, current_user)  # verify ownership
@@ -1513,6 +1531,7 @@ async def upload_resumes(
             results.append({"file_name": getattr(f, "filename", None), "status": "error", "reason": str(e)})
 
     return {"status": "ok", "count": len(results), "results": results}
+
 @app.get("/jobs/{job_id}/resumes")
 async def list_resumes(
     job_id: str,
@@ -1577,37 +1596,62 @@ async def list_resumes(
 
 # Create
 @app.post("/interviewers", response_model=InterviewerOut)
-async def create_interviewer(
-    body: InterviewerCreate,
+async def invite_interviewer(
+    body: InterviewerInvite,
     current_user: UserIdentity = Depends(get_current_user),
 ):
-    company_id = _get_company_id_for_user(current_user)
-    if not company_id:
-        raise HTTPException(400, "Please create company profile first")
+    rec = _ensure_company(current_user)
+    company_id = rec["company_id"]
 
-    # unique email constraint handling
+    # enforce uniqueness per company
     existing = (
         supabase.table("interviewers")
         .select("interviewer_id")
-        .eq("email", body.email.lower())
         .eq("company_id", company_id)
+        .eq("email", body.email.lower())
         .limit(1)
         .execute()
         .data
     )
     if existing:
-        raise HTTPException(status_code=409, detail="Interviewer with this email already exists")
+        raise HTTPException(409, "Interviewer with this email already exists in this company")
 
-    insert = {
-        "name": body.name.strip(),
-        "email": body.email.lower(),
-        "password_hash": _hash_password(body.password),
-        "company_id": company_id,
-        "created_by": current_user.user_id,
-        "is_active": bool(body.is_active),
-    }
-    res = supabase.table("interviewers").insert(insert).execute()
-    row = res.data[0]
+    admin = supabase.auth.admin
+
+    # 1) Send an invite email (Supabase sends it via SMTP)
+    # NOTE: 'options' shape varies with library versions, we handle both.
+    try:
+        invited = admin.invite_user_by_email(
+            body.email.lower(),
+            { "redirect_to": INVITE_REDIRECT }
+        )
+    except Exception:
+        # older signatures sometimes use 'data' kw; this keeps it robust
+        invited = admin.invite_user_by_email(body.email.lower(), {"redirect_to": INVITE_REDIRECT})
+
+    auth_user_id = invited.user.id
+
+    # 2) Set metadata (invite API only sets user_metadata by default)
+    admin.update_user_by_id(auth_user_id, {
+        "app_metadata":  {"role": "interviewer", "company_id": company_id},
+        "user_metadata": {"name": body.name},
+    })
+
+    # 3) Insert your shadow row
+    row = (
+        supabase.table("interviewers")
+        .insert({
+            "company_id": company_id,
+            "auth_user_id": auth_user_id,
+            "name": body.name.strip(),
+            "email": body.email.lower(),
+            "is_active": bool(body.is_active),
+            "created_by": current_user.user_id,
+        })
+        .execute()
+        .data[0]
+    )
+
     return {
         "interviewer_id": row["interviewer_id"],
         "name": row["name"],
@@ -1615,6 +1659,8 @@ async def create_interviewer(
         "company_id": row.get("company_id"),
         "is_active": row.get("is_active", True),
     }
+
+
 
 @app.get("/interviewers", response_model=List[InterviewerOut])
 async def list_interviewers(
@@ -1689,32 +1735,53 @@ async def update_interviewer(
     body: InterviewerUpdate,
     current_user: UserIdentity = Depends(get_current_user),
 ):
-    company_id = _get_company_id_for_user(current_user)
+    rec = _ensure_company(current_user)
+    company_id = rec["company_id"]
 
-    update_data: Dict[str, Any] = {}
-    if body.name is not None:
-        update_data["name"] = body.name.strip()
-    if body.email is not None:
-        update_data["email"] = body.email.lower()
-    if body.password is not None:
-        update_data["password_hash"] = _hash_password(body.password)
-    if body.is_active is not None:
-        update_data["is_active"] = bool(body.is_active)
-
-    if not update_data:
-        raise HTTPException(400, "Nothing to update")
-
-    res = (
+    # 1) Fetch current row to get auth_user_id
+    existing = (
         supabase.table("interviewers")
-        .update(update_data)
+        .select("interviewer_id, auth_user_id, name, email, company_id, is_active")
         .eq("interviewer_id", interviewer_id)
         .eq("company_id", company_id)
+        .single()
         .execute()
         .data
     )
-    if not res:
-        raise HTTPException(404, "Interviewer not found or unauthorized")
-    row = res[0]
+    if not existing:
+        raise HTTPException(404, "Interviewer not found")
+
+    updates: Dict[str, Any] = {}
+    if body.name is not None:
+        updates["name"] = body.name.strip()
+    if body.email is not None:
+        updates["email"] = body.email.lower()
+    if body.is_active is not None:
+        updates["is_active"] = bool(body.is_active)
+
+    if not updates:
+        return existing  # nothing to do
+
+    # 2) Update Auth user (only if name/email changed)
+    admin = supabase.auth.admin
+    auth_updates: Dict[str, Any] = {}
+    if "name" in updates:
+        auth_updates.setdefault("user_metadata", {})["name"] = updates["name"]
+    if "email" in updates:
+        auth_updates["email"] = updates["email"]
+
+    if auth_updates:
+        admin.update_user_by_id(existing["auth_user_id"], auth_updates)
+
+    # 3) Update your row
+    row = (
+        supabase.table("interviewers")
+        .update(updates)
+        .eq("interviewer_id", interviewer_id)
+        .eq("company_id", company_id)
+        .execute()
+        .data[0]
+    )
     return {
         "interviewer_id": row["interviewer_id"],
         "name": row["name"],
@@ -1723,42 +1790,199 @@ async def update_interviewer(
         "is_active": row.get("is_active", True),
     }
 
+@app.post("/interviewers/{interviewer_id}/deactivate")
+async def deactivate_interviewer(
+    interviewer_id: str,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    rec = _ensure_company(current_user)
+    company_id = rec["company_id"]
 
-# Delete (soft by default; hard with ?hard=true)
+    row = (
+        supabase.table("interviewers")
+        .select("auth_user_id")
+        .eq("interviewer_id", interviewer_id)
+        .eq("company_id", company_id)
+        .single()
+        .execute()
+        .data
+    )
+    if not row:
+        raise HTTPException(404, "Interviewer not found")
+
+    admin = supabase.auth.admin
+    # Mark blocked in app_metadata (enforce in RLS or app logic)
+    admin.update_user_by_id(row["auth_user_id"], {"app_metadata": {"blocked": True}})
+    supabase.table("interviewers").update({"is_active": False}).eq("interviewer_id", interviewer_id).execute()
+    return {"message": "Interviewer deactivated"}
+
+@app.post("/interviewers/{interviewer_id}/reactivate")
+async def reactivate_interviewer(
+    interviewer_id: str,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    rec = _ensure_company(current_user)
+    company_id = rec["company_id"]
+
+    row = (
+        supabase.table("interviewers")
+        .select("auth_user_id")
+        .eq("interviewer_id", interviewer_id)
+        .eq("company_id", company_id)
+        .single()
+        .execute()
+        .data
+    )
+    if not row:
+        raise HTTPException(404, "Interviewer not found")
+
+    admin = supabase.auth.admin
+    admin.update_user_by_id(row["auth_user_id"], {"app_metadata": {"blocked": False}})
+    supabase.table("interviewers").update({"is_active": True}).eq("interviewer_id", interviewer_id).execute()
+    return {"message": "Interviewer reactivated"}
+
+
 @app.delete("/interviewers/{interviewer_id}")
 async def delete_interviewer(
     interviewer_id: str,
     hard: bool = Query(False, description="set true to hard delete"),
     current_user: UserIdentity = Depends(get_current_user),
 ):
-    company_id = _get_company_id_for_user(current_user)
+    rec = _ensure_company(current_user)
+    company_id = rec["company_id"]
 
-    if hard:
-        res = (
-            supabase.table("interviewers")
-            .delete()
-            .eq("interviewer_id", interviewer_id)
-            .eq("company_id", company_id)
-            .execute()
-            .data
-        )
-        if not res:
-            raise HTTPException(404, "Interviewer not found or unauthorized")
-        return {"message": "Interviewer deleted", "interviewer_id": interviewer_id, "hard": True}
-
-    # soft delete
-    res = (
+    row = (
         supabase.table("interviewers")
-        .update({"is_active": False})
+        .select("auth_user_id")
         .eq("interviewer_id", interviewer_id)
         .eq("company_id", company_id)
+        .single()
         .execute()
         .data
     )
-    if not res:
-        raise HTTPException(404, "Interviewer not found or unauthorized")
-    return {"message": "Interviewer deactivated", "interviewer_id": interviewer_id, "hard": False}
-# =================== end INTERVIEWERS CRUD ===================
+    if not row:
+        raise HTTPException(404, "Interviewer not found")
+
+    if hard:
+        supabase.auth.admin.delete_user(row["auth_user_id"])
+        supabase.table("interviewers").delete().eq("interviewer_id", interviewer_id).eq("company_id", company_id).execute()
+        return {"message": "Interviewer deleted", "hard": True}
+
+    # soft delete
+    supabase.table("interviewers").update({"is_active": False}).eq("interviewer_id", interviewer_id).eq("company_id", company_id).execute()
+    supabase.auth.admin.update_user_by_id(row["auth_user_id"], {"app_metadata": {"blocked": True}})
+    return {"message": "Interviewer deactivated", "hard": False}
+
+@app.post("/interviewers/{interviewer_id}/send-reset", response_model=SendResetOut)
+async def send_reset_link(
+    interviewer_id: str,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    rec = _ensure_company(current_user)
+    company_id = rec["company_id"]
+
+    row = (
+        supabase.table("interviewers")
+        .select("email")
+        .eq("interviewer_id", interviewer_id)
+        .eq("company_id", company_id)
+        .single()
+        .execute()
+        .data
+    )
+    if not row:
+        raise HTTPException(404, "Interviewer not found")
+
+    email = row["email"].lower()
+
+    # supabase-py differs by version; try the common names in order
+    try:
+        supabase.auth.reset_password_for_email(email, options={"redirect_to": RESET_REDIRECT})
+    except AttributeError:
+        try:
+            supabase.auth.reset_password_for_email(email, {"redirect_to": RESET_REDIRECT})
+        except Exception:
+            # fallback name in some builds
+            supabase.auth.reset_password_email(email, {"redirect_to": RESET_REDIRECT})
+
+    # For UX, return a generic message; the actual email is sent by Supabase.
+    return {"action_link": f"(email sent) redirect_to={RESET_REDIRECT}"}
+
+@app.post("/auth/interviewer/signin", response_model=InterviewerSessionOut)
+async def interviewer_signin(body: InterviewerSignIn):
+    try:
+        # 1) sign in with email/password
+        resp = supabase.auth.sign_in_with_password(
+            {"email": body.email, "password": body.password}
+        )
+        if not resp.session or not resp.user:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+
+        user = resp.user
+        # 2) optional safety: honor app_metadata.blocked
+        app_meta = (getattr(user, "app_metadata", None) or {})
+        if app_meta.get("blocked") is True:
+            raise HTTPException(status_code=403, detail="Account is blocked")
+
+        # 3) find the interviewer shadow row by auth_user_id (preferred), fallback by email
+        row = (
+            supabase.table("interviewers")
+            .select("*")
+            .eq("auth_user_id", user.id)
+            .single()
+            .execute()
+            .data
+        )
+        if not row:
+            row = (
+                supabase.table("interviewers")
+                .select("*")
+                .eq("email", body.email.lower())
+                .single()
+                .execute()
+                .data
+            )
+
+        if not row:
+            raise HTTPException(status_code=403, detail="Not an interviewer")
+        if not row.get("is_active", True):
+            raise HTTPException(status_code=403, detail="Interviewer is deactivated")
+
+        return {
+            "access_token": resp.session.access_token,
+            "refresh_token": resp.session.refresh_token,
+            "user": {"id": user.id, "email": user.email},
+            "interviewer": {
+                "interviewer_id": row["interviewer_id"],
+                "name": row.get("name"),
+                "email": row.get("email"),
+                "company_id": row.get("company_id"),
+                "is_active": row.get("is_active", True),
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Login failed: {e}")
+
+@app.get("/interviewer/me")
+async def interviewer_me(current_user: UserIdentity = Depends(get_current_user)):
+    row = (
+        supabase.table("interviewers")
+        .select("interviewer_id, name, email, company_id, is_active")
+        .eq("auth_user_id", current_user.user_id)
+        .single()
+        .execute()
+        .data
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Interviewer profile not found")
+    if not row.get("is_active", True):
+        raise HTTPException(status_code=403, detail="Interviewer is deactivated")
+    return {
+        "user": {"id": current_user.user_id, "email": current_user.email},
+        "interviewer": row,
+    }
 
 # ---------------------------------------------------------------------------
 # run (local)
