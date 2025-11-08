@@ -168,6 +168,17 @@ class InterviewerOut(BaseModel):
     company_id: Optional[str] = None
     is_active: bool = True
 
+# ---- Pydantic for interviewer auth ----
+class InterviewerSignIn(BaseModel):
+    email: EmailStr
+    password: str
+
+class InterviewerSessionOut(BaseModel):
+    access_token: str
+    refresh_token: str
+    user: Dict[str, Any]
+    interviewer: Dict[str, Any]
+
 # ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------
@@ -1905,6 +1916,82 @@ async def send_reset_link(
 
     # For UX, return a generic message; the actual email is sent by Supabase.
     return {"action_link": f"(email sent) redirect_to={RESET_REDIRECT}"}
+
+@app.post("/auth/interviewer/signin", response_model=InterviewerSessionOut)
+async def interviewer_signin(body: InterviewerSignIn):
+    try:
+        # 1) sign in with email/password
+        resp = supabase.auth.sign_in_with_password(
+            {"email": body.email, "password": body.password}
+        )
+        if not resp.session or not resp.user:
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+
+        user = resp.user
+        # 2) optional safety: honor app_metadata.blocked
+        app_meta = (getattr(user, "app_metadata", None) or {})
+        if app_meta.get("blocked") is True:
+            raise HTTPException(status_code=403, detail="Account is blocked")
+
+        # 3) find the interviewer shadow row by auth_user_id (preferred), fallback by email
+        row = (
+            supabase.table("interviewers")
+            .select("*")
+            .eq("auth_user_id", user.id)
+            .single()
+            .execute()
+            .data
+        )
+        if not row:
+            row = (
+                supabase.table("interviewers")
+                .select("*")
+                .eq("email", body.email.lower())
+                .single()
+                .execute()
+                .data
+            )
+
+        if not row:
+            raise HTTPException(status_code=403, detail="Not an interviewer")
+        if not row.get("is_active", True):
+            raise HTTPException(status_code=403, detail="Interviewer is deactivated")
+
+        return {
+            "access_token": resp.session.access_token,
+            "refresh_token": resp.session.refresh_token,
+            "user": {"id": user.id, "email": user.email},
+            "interviewer": {
+                "interviewer_id": row["interviewer_id"],
+                "name": row.get("name"),
+                "email": row.get("email"),
+                "company_id": row.get("company_id"),
+                "is_active": row.get("is_active", True),
+            },
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Login failed: {e}")
+
+@app.get("/interviewer/me")
+async def interviewer_me(current_user: UserIdentity = Depends(get_current_user)):
+    row = (
+        supabase.table("interviewers")
+        .select("interviewer_id, name, email, company_id, is_active")
+        .eq("auth_user_id", current_user.user_id)
+        .single()
+        .execute()
+        .data
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Interviewer profile not found")
+    if not row.get("is_active", True):
+        raise HTTPException(status_code=403, detail="Interviewer is deactivated")
+    return {
+        "user": {"id": current_user.user_id, "email": current_user.email},
+        "interviewer": row,
+    }
 
 # ---------------------------------------------------------------------------
 # run (local)
