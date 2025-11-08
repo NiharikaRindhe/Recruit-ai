@@ -76,8 +76,8 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in environment")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-INVITE_REDIRECT = os.getenv("INTERVIEWER_INVITE_REDIRECT", "http://localhost:3000/set-password")
-RESET_REDIRECT  = os.getenv("PASSWORD_RESET_REDIRECT", "http://localhost:3000/reset")
+INVITE_REDIRECT = os.getenv("INTERVIEWER_INVITE_REDIRECT")
+RESET_REDIRECT  = os.getenv("PASSWORD_RESET_REDIRECT")
 # ---------- NEW: storage + TTL settings ----------
 RESUME_BUCKET = os.getenv("RESUME_BUCKET", "resumes")
 RESUME_TTL_HOURS = int(os.getenv("RESUME_TTL_HOURS", "36"))
