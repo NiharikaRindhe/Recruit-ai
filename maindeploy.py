@@ -2,8 +2,7 @@ import os
 import re
 import json
 from typing import Optional, List, Dict, Any
-
-from fastapi import FastAPI, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import JSONResponse
@@ -12,6 +11,52 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 import jwt
 import requests
+
+import hashlib
+import datetime
+import fitz  # PyMuPDF
+# Safe import for different storage3 versions
+try:
+    from storage3.utils import UploadFileOptions  # v2+
+except Exception:  # older SDKs won't have it
+    UploadFileOptions = None
+
+# secure hashing (recommended)
+# -------- Password hashing (Passlib preferred; safe fallback) --------
+try:
+    from passlib.context import CryptContext  # pip install passlib[bcrypt]
+    pwd_context = CryptContext(schemes=["bcrypt_sha256"], deprecated="auto")
+
+    def _hash_password(p: str) -> str:
+        return pwd_context.hash(p)
+
+    def _verify_password(p: str, h: str) -> bool:
+        return pwd_context.verify(p, h)
+
+except Exception:
+    # Fallback: salted sha256 (only if passlib isn't installed) – less secure
+    import os, base64, hashlib
+
+    def _hash_password(p: str) -> str:
+        salt = os.urandom(16)
+        h = hashlib.sha256(salt + p.encode("utf-8")).digest()
+        return "sha256$" + base64.b64encode(salt + h).decode("utf-8")
+
+    def _verify_password(p: str, h: str) -> bool:
+        if not h.startswith("sha256$"):
+            return False
+        raw = base64.b64decode(h.split("sha256$", 1)[1].encode("utf-8"))
+        salt, digest = raw[:16], raw[16:]
+        return hashlib.sha256(salt + p.encode("utf-8")).digest() == digest
+
+from passlib.context import CryptContext
+
+# one global password-hashing context (removes bcrypt 72-byte limit)
+pwd_context = CryptContext(
+    schemes=["bcrypt_sha256"],
+    deprecated="auto",
+)
+
 
 # ---------------------------------------------------------------------------
 # env
@@ -31,7 +76,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
 # ---------------------------------------------------------------------------
 # Supabase
 # ---------------------------------------------------------------------------
@@ -41,19 +85,21 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in environment")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-
+INVITE_REDIRECT = os.getenv("INTERVIEWER_INVITE_REDIRECT", "http://localhost:3000/set-password")
+RESET_REDIRECT  = os.getenv("PASSWORD_RESET_REDIRECT", "http://localhost:3000/reset")
+# ---------- NEW: storage + TTL settings ----------
+RESUME_BUCKET = os.getenv("RESUME_BUCKET", "resumes")
+RESUME_TTL_HOURS = int(os.getenv("RESUME_TTL_HOURS", "36"))
 # ---------------------------------------------------------------------------
 # Ollama (cloud-first)
 # ---------------------------------------------------------------------------
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "https://ollama.com/api")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
-
 # ---------------------------------------------------------------------------
 # Security
 # ---------------------------------------------------------------------------
 security = HTTPBearer()
-
 # ---------------------------------------------------------------------------
 # Pydantic models
 # ---------------------------------------------------------------------------
@@ -61,11 +107,9 @@ class SignUpRequest(BaseModel):
     email: EmailStr
     password: str
 
-
 class SignInRequest(BaseModel):
     email: EmailStr
     password: str
-
 
 class CompanyRequest(BaseModel):
     company_name: str
@@ -73,7 +117,6 @@ class CompanyRequest(BaseModel):
     location: Optional[str] = None
     linkedin_url: Optional[str] = None
     description: Optional[str] = None
-
 
 class JDCreateRequest(BaseModel):
     job_title: str
@@ -88,20 +131,42 @@ class JDCreateRequest(BaseModel):
     requirements: str
     location: Optional[str] = None
 
-
 class JDIngestText(BaseModel):
     jd_text: str
-
 
 class JDIngestAnswer(BaseModel):
     original_jd_text: str
     parsed: Dict[str, Any]
     answers: Dict[str, Any]
 
-
 class UserIdentity(BaseModel):
     user_id: str
     email: str
+
+class ParseOneRequest(BaseModel):
+    storage_key: Optional[str] = None
+    file_hash: Optional[str] = None
+    email_hint: Optional[str] = None  # optional override
+
+class InterviewerInvite(BaseModel):
+    name: str
+    email: EmailStr
+    is_active: Optional[bool] = True  # default True
+
+class InterviewerUpdate(BaseModel):
+    name: Optional[str] = None
+    email: Optional[EmailStr] = None
+    is_active: Optional[bool] = None
+
+class SendResetOut(BaseModel):
+    action_link: str  # helpful in dev; in prod you’ll email it, but still return it for UI fallback
+
+class InterviewerOut(BaseModel):
+    interviewer_id: str
+    name: str
+    email: EmailStr
+    company_id: Optional[str] = None
+    is_active: bool = True
 
 # ---------------------------------------------------------------------------
 # Auth helpers
@@ -111,7 +176,6 @@ def verify_token(token: str) -> Optional[dict]:
         return jwt.decode(token, options={"verify_signature": False})
     except Exception:
         return None
-
 
 async def get_current_user(
     credentials: HTTPAuthorizationCredentials = Depends(security),
@@ -128,19 +192,16 @@ async def get_current_user(
 
     return UserIdentity(user_id=user_id, email=email)
 
-
 # ---------------------------------------------------------------------------
 # Ollama helpers
 # ---------------------------------------------------------------------------
 def _is_cloud_host(base_url: str) -> bool:
     return base_url.startswith("https://ollama.com")
 
-
 def _normalize_model_tag(model: str, cloud: bool) -> str:
     if cloud and model.endswith("-cloud"):
         return model[:-6]
     return model
-
 
 def generate_jd_with_ollama(prompt: str) -> str:
     try:
@@ -169,7 +230,6 @@ def generate_jd_with_ollama(prompt: str) -> str:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ollama error: {e}")
-
 
 # ---------------------------------------------------------------------------
 # JD prompt
@@ -235,7 +295,6 @@ Formatting rules:
 """.strip()
     return prompt
 
-
 # ---------------------------------------------------------------------------
 # tiny JD text parser for /jd/ingest-text
 # ---------------------------------------------------------------------------
@@ -260,7 +319,6 @@ def normalize_work_mode(raw: Optional[str]) -> str:
     # fallback
     return "online"
 
-
 def normalize_employment_type(raw: Optional[str]) -> str:
     if not raw:
         return "Full-time"
@@ -272,7 +330,6 @@ def normalize_employment_type(raw: Optional[str]) -> str:
     if "intern" in r or "trainee" in r:
         return "Internship"
     return "Full-time"
-
 
 def _extract_skills(block: str) -> List[str]:
     if not block:
@@ -288,7 +345,6 @@ def _extract_skills(block: str) -> List[str]:
         if p:
             out.append(p)
     return out
-
 
 def _extract_fields_from_jd_text(jd_text: str) -> Dict[str, Any]:
     """Very small heuristic parser for a pasted JD."""
@@ -329,7 +385,7 @@ def _extract_fields_from_jd_text(jd_text: str) -> Dict[str, Any]:
             work_mode = "remote"
         elif re.search(r"(?i)\bhybrid\b", text):
             work_mode = "hybrid"
-        elif re.search(r"(?i)\bonsite|on-site|office\b", text):
+        elif re.search(r"(?i)\b(?:onsite|on-site|office)\b", text):
             work_mode = "onsite"
 
     # experience
@@ -364,7 +420,6 @@ def _extract_fields_from_jd_text(jd_text: str) -> Dict[str, Any]:
         "jd_text": text,
     }
 
-
 def _detect_missing_fields(parsed: Dict[str, Any]) -> List[Dict[str, str]]:
     """Return a list of questions we should ask the recruiter."""
     q = []
@@ -394,14 +449,41 @@ def _detect_missing_fields(parsed: Dict[str, Any]) -> List[Dict[str, str]]:
 
     return q
 
+def _download_from_storage(key: str) -> bytes:
+    bucket = supabase.storage.from_(RESUME_BUCKET)
+    return bucket.download(key)
+
+def _get_job_owned(job_id: str, user: UserIdentity) -> dict:
+    job = (
+        supabase.table("jobs")
+        .select("*")
+        .eq("job_id", job_id)
+        .eq("created_by", user.user_id)
+        .single()
+        .execute()
+        .data
+    )
+    if not job:
+        raise HTTPException(404, "Job not found or unauthorized")
+    return job
+
+def _get_company_id_for_user(user: UserIdentity) -> Optional[str]:
+    rec = (
+        supabase.table("recruiters")
+        .select("company_id")
+        .eq("user_id", user.user_id)
+        .limit(1)
+        .execute()
+        .data
+    )
+    return rec[0]["company_id"] if rec else None
 
 # ---------------------------------------------------------------------------
-# routes
+# routes (YOUR ORIGINAL ROUTES — UNCHANGED)
 # ---------------------------------------------------------------------------
 @app.get("/")
 async def root():
     return {"message": "Recruitment AI API is running", "status": "active"}
-
 
 # ---------- auth ----------
 @app.post("/auth/signup")
@@ -413,7 +495,6 @@ async def signup(request: SignUpRequest):
         raise HTTPException(status_code=400, detail="Failed to create user")
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
 
 @app.post("/auth/signin")
 async def signin(request: SignInRequest):
@@ -428,7 +509,6 @@ async def signin(request: SignInRequest):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid email or password")
-
 
 # ---------- me ----------
 @app.get("/me")
@@ -465,7 +545,6 @@ async def get_me(current_user: UserIdentity = Depends(get_current_user)):
         "company": None,
         "has_company": False,
     }
-
 
 # ---------- company ----------
 @app.post("/company/create")
@@ -516,7 +595,6 @@ async def create_company(request: CompanyRequest, current_user: UserIdentity = D
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error creating company: {e}")
 
-
 # ---------- jd/create (UI flow) ----------
 @app.post("/jd/create")
 async def create_jd(request: JDCreateRequest, current_user: UserIdentity = Depends(get_current_user)):
@@ -555,7 +633,6 @@ async def create_jd(request: JDCreateRequest, current_user: UserIdentity = Depen
         return {"message": "JD generated successfully", "job_id": job_result.data[0]["job_id"], "jd_text": jd_text}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error creating JD: {e}")
-
 
 # ---------- jd/regenerate ----------
 @app.post("/jd/regenerate/{job_id}")
@@ -605,7 +682,6 @@ async def regenerate_jd(job_id: str, current_user: UserIdentity = Depends(get_cu
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error regenerating JD: {e}")
 
-
 # ---------- jd/edit ----------
 @app.put("/jd/edit/{job_id}")
 async def edit_jd(job_id: str, jd_text: str, current_user: UserIdentity = Depends(get_current_user)):
@@ -623,7 +699,6 @@ async def edit_jd(job_id: str, jd_text: str, current_user: UserIdentity = Depend
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error updating JD: {e}")
 
-
 # ---------- jobs/my-jobs ----------
 @app.get("/jobs/my-jobs")
 async def get_my_jobs(current_user: UserIdentity = Depends(get_current_user)):
@@ -638,7 +713,6 @@ async def get_my_jobs(current_user: UserIdentity = Depends(get_current_user)):
         return {"jobs": jobs.data}
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error fetching jobs: {e}")
-
 
 # ---------- NEW: recruiter pastes full JD text ----------
 @app.post("/jd/ingest-text")
@@ -799,6 +873,1038 @@ async def ingest_answer(
         "job": job_res.data[0],
     }
 
+# ---------------------------------------------------------------------------
+# ----------------------- NEW: RESUME PIPELINE ------------------------------
+# ---------------------------------------------------------------------------
+
+def _sha256_bytes(b: bytes) -> str:
+    h = hashlib.sha256()
+    h.update(b)
+    return h.hexdigest()
+
+def _extract_text_pdf(pdf_bytes: bytes) -> str:
+    with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
+        return "\n".join([p.get_text("text") for p in doc])
+
+def _norm_token(s: str) -> str:
+    return re.sub(r"[^a-z0-9+\-.#]", "", (s or "").lower())
+
+def _canonicalize(sk: str) -> str:
+    m = {
+        "reactjs": "react", "react.js": "react",
+        "nodejs": "node", "node.js": "node",
+        "ts": "typescript", "py": "python",
+        "c++": "cpp", "c#": "csharp",
+    }
+    x = _norm_token(sk)
+    return m.get(x, x)
+
+def _skill_groups(must: List[str], nice: List[str]) -> Dict[str, set]:
+    groups: Dict[str, set] = {}
+    for s in (must or []) + (nice or []):
+        if not s:
+            continue
+        can = _canonicalize(s)
+        if not can:
+            continue
+        groups.setdefault(can, set()).add(can)
+    if "javascript" in groups:
+        groups["javascript"].update({"js"})
+    if "html" in groups:
+        groups["html"].update({"html5"})
+    if "css" in groups:
+        groups["css"].update({"css3"})
+    return groups
+
+def _flatten_resume_tokens(text: str) -> set:
+    toks = {_canonicalize(t) for t in re.findall(r"[A-Za-z0-9+.#\-]{2,}", text or "")}
+    return {t for t in toks if t}
+
+def _years_from_text(text: str) -> float:
+    y = 0.0
+    for m in re.finditer(r"(\d{4})\s*[-–]\s*(\d{4}|present|current)", (text or "").lower()):
+        a, b = m.group(1), m.group(2)
+        try:
+            aa = int(a)
+            bb = datetime.datetime.utcnow().year if ("present" in b or "current" in b) else int(b)
+            if bb >= aa:
+                y += (bb - aa)
+        except Exception:
+            pass
+    return round(y, 2)
+
+def _experience_match(actual: float, miny: Optional[float], maxy: Optional[float]) -> int:
+    if actual is None:
+        return 0
+    if miny is None and maxy is None:
+        return 0
+    if miny is not None and actual < miny:
+        return max(0, round(100 * (actual / max(miny, 0.01))))
+    return 100
+
+def _score(text: str, must: List[str], nice: List[str], miny: Optional[float], maxy: Optional[float]) -> Dict[str, Any]:
+    groups = _skill_groups(must, nice)
+    res_tokens = _flatten_resume_tokens(text)
+    matched = [g for g, aliases in groups.items() if res_tokens & aliases]
+    total_groups = max(1, len(groups))
+    skill_match = round(100.0 * len(matched) / total_groups, 2)
+    yoe = _years_from_text(text)
+    exp_score = _experience_match(yoe, miny, maxy)
+    jd_match = round(0.65 * skill_match + 0.35 * exp_score, 2)
+    return {
+        "jd_match_score": jd_match,
+        "meta": {
+            "total_experience_years": yoe,
+            "skill_groups_total": total_groups,
+            "skill_groups_matched": matched,
+            "skill_match_score": skill_match,
+            "experience_match_score": exp_score,
+            "top_matched_skills": matched[:10],
+        }
+    }
+# ====== LLM helpers for resume parsing & summary (ADD THIS BLOCK) ======
+
+# We’ll just reuse your Ollama caller.
+def _ollama_generate(prompt: str) -> str:
+    return generate_jd_with_ollama(prompt)
+
+# Prompts
+ALLOWED_RESUME_STATUSES = {"PENDING", "PARSED", "REJECTED"}
+
+EXTRACT_PROMPT = (
+    "You are a resume parsing assistant. Return ONLY JSON with these exact top-level keys: "
+    "first_name, last_name, full_name, email, phone, location, links, skills, experience, education, projects, certifications.\n"
+    "Formatting rules:\n"
+    "- links: object; optional keys: linkedin, github, portfolio, other (strings).\n"
+    "- skills: object; keys: languages, frameworks, databases, tools, soft_skills (arrays of strings).\n"
+    "- experience: array of objects with keys: company, title, start_date, end_date, description, technologies (array).\n"
+    "- education: array of objects with keys: degree, institution, start_year, end_year, score.\n"
+    "- projects: array of objects with keys: name, description, technologies (array), link, impact.\n"
+    "- certifications: array of strings.\n"
+    "No comments, no trailing commas.\n"
+    "RESUME TEXT:\n{resume_text}"
+)
+# --- Rich JD↔︎Resume analysis (markdown) ---
+ANALYSIS_PROMPT = """
+You are a technical recruiter assistant. Compare the JOB DESCRIPTION and the CANDIDATE RESUME and write a concise analysis in Markdown.
+
+Return ONLY Markdown with these sections (use the exact headings):
+### Verdict
+(one of: Strong Fit, Fit, Borderline, Not a Fit) with a one-sentence rationale.
+
+### Key Matches
+- Map must-have requirements to concrete evidence from the resume (role, dates, tech).
+
+### Gaps
+- List missing or weak items; mark each as **major** or **minor**.
+
+### Experience Check
+- Years parsed: {yoe} vs JD min: {miny} / max: {maxy}. Brief comment.
+
+### Risk Flags
+- Any red flags (employment gaps, very short stints, mismatched titles, etc.). If none, write "None noted."
+
+### Scores
+- Skill match: {skill_score} / 100
+- Experience match: {exp_score} / 100
+- Overall JD match: {overall_score} / 100
+
+### Recommendation
+- One of: Proceed to phone screen / Proceed to technical screen / Hold for backup / Reject (with reason).
+
+DATA:
+JD TITLE: {role}
+MUST-HAVES: {must}
+NICE-TO-HAVES: {nice}
+
+JOB DESCRIPTION (truncated):
+{jd}
+
+CANDIDATE (parsed & truncated):
+{cand}
+
+Only use information present above. Be specific, avoid fluff. Keep total under ~250 words.
+""".strip()
+
+def generate_resume_analysis(
+    candidate: dict,
+    meta: dict,
+    jd_text: str,
+    role: Optional[str],
+    must: List[str],
+    nice: List[str],
+    miny: Optional[float],
+    maxy: Optional[float],
+) -> str:
+    # compact the candidate payload to keep prompt small
+    cand_compact = {
+        "name": candidate.get("full_name")
+                or f"{candidate.get('first_name','')} {candidate.get('last_name','')}".strip(),
+        "location": candidate.get("location"),
+        "links": candidate.get("links"),
+        "skills": candidate.get("skills"),
+        "experience": (candidate.get("experience") or [])[:5],
+        "education": (candidate.get("education") or [])[:3],
+        "projects": (candidate.get("projects") or [])[:3],
+        "certifications": candidate.get("certifications") or [],
+    }
+
+    overall = round(
+        0.65 * float(meta.get("skill_match_score", 0)) +
+        0.35 * float(meta.get("experience_match_score", 0)), 2
+    )
+
+    prompt = ANALYSIS_PROMPT.format(
+        role=role or "Software Engineer",
+        must=", ".join(must or []),
+        nice=", ".join(nice or []),
+        jd=(jd_text or "")[:2000],
+        cand=json.dumps(cand_compact, ensure_ascii=False)[:2500],
+        yoe=meta.get("total_experience_years", "n/a"),
+        miny=miny if miny is not None else "n/a",
+        maxy=maxy if maxy is not None else "n/a",
+        skill_score=meta.get("skill_match_score", 0),
+        exp_score=meta.get("experience_match_score", 0),
+        overall_score=overall,
+    )
+    try:
+        return _ollama_generate(prompt).strip()[:3000]
+    except Exception:
+        return "Analysis unavailable."
+
+# JSON tidying for slightly-invalid LLM JSON
+def _json_fragment(s: str) -> str:
+    start = s.find("{")
+    end = s.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return s[start:end+1]
+    return s
+
+def _tidy_json(s: str) -> str:
+    s = re.sub(r",\s*([}\]])", r"\1", s)
+    s = re.sub(r"\bTrue\b", "true", s)
+    s = re.sub(r"\bFalse\b", "false", s)
+    s = re.sub(r"\bNone\b", "null", s)
+    s = re.sub(r"[\x00-\x1F\x7F]", " ", s)
+    return s
+
+# Normalize skills dict to consistent arrays
+_DEF_SK_KEYS = ["languages", "frameworks", "databases", "tools", "soft_skills"]
+
+def _normalize_skills_block(sk: dict) -> dict:
+    out = {k: [] for k in _DEF_SK_KEYS}
+    if isinstance(sk, dict):
+        for k in _DEF_SK_KEYS:
+            v = sk.get(k)
+            if isinstance(v, list):
+                out[k] = [str(x).strip() for x in v if str(x).strip()]
+            elif isinstance(v, str):
+                out[k] = [x.strip() for x in re.split(r",|/|\n", v) if x.strip()]
+    return out
+
+def parse_resume_structured(resume_text: str) -> dict:
+    """LLM-based extractor → dict. Safe against minor JSON formatting issues."""
+    try:
+        raw = _ollama_generate(EXTRACT_PROMPT.format(resume_text=resume_text[:8000]))
+        frag = _json_fragment(raw)
+        try:
+            data = json.loads(frag)
+        except Exception:
+            data = json.loads(_tidy_json(frag))
+    except Exception:
+        data = {}
+
+    # Ensure shapes
+    data = data or {}
+    data.setdefault("links", {})
+    data.setdefault("skills", {})
+    data.setdefault("experience", [])
+    data.setdefault("education", [])
+    data.setdefault("projects", [])
+    data.setdefault("certifications", [])
+    data["skills"] = _normalize_skills_block(data.get("skills") or {})
+    return data
+
+# ====== end LLM helpers block ======
+
+def _safe_json_list(x) -> List[str]:
+    if isinstance(x, list):
+        return x
+    if isinstance(x, str):
+        try:
+            return json.loads(x)
+        except Exception:
+            return []
+    return []
+
+def _ensure_bucket():
+    # idempotent
+    try:
+        supabase.storage.create_bucket(RESUME_BUCKET, {"public": False})
+    except Exception:
+        # bucket may already exist
+        pass
+
+sb = supabase
+def _upload_to_storage(job_id: str, sha: str, filename: str, content: bytes) -> str:
+    """
+    Upload bytes to Supabase Storage with the correct content-type.
+    Works across storage3 versions (uses UploadFileOptions if available).
+    """
+    _ensure_bucket()  # just in case
+    bucket = supabase.storage.from_(RESUME_BUCKET)
+
+    safe_name = re.sub(r'[^A-Za-z0-9._-]+', '_', filename or 'resume.pdf')
+    key = f"{job_id}/{sha}_{safe_name}"
+
+    # Newer storage3 supports UploadFileOptions
+    if UploadFileOptions is not None:
+        opts = UploadFileOptions(
+            content_type="application/pdf",  # IMPORTANT (avoids 'text/plain is not supported')
+            cache_control="3600",
+            upsert=True,
+        )
+        bucket.upload(key, content, file_options=opts)  # use keyword arg
+    else:
+        # Older storage3: pass a headers-like dict via file_options (must be lowercase strings)
+        bucket.upload(
+            key,
+            content,
+            file_options={
+                "content-type": "application/pdf",
+                "cache-control": "3600",
+                "x-upsert": "true",
+            },
+        )
+
+    return key
+
+@app.post("/jobs/{job_id}/parse_upload")
+async def parse_upload(
+    job_id: str,
+    body: ParseOneRequest,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    job = _get_job_owned(job_id, current_user)
+
+    if not (body.storage_key or body.file_hash):
+        raise HTTPException(400, "Provide storage_key or file_hash")
+
+    # resolve storage_key if only file_hash was given
+    storage_key = body.storage_key
+    filename_hint = None
+    if not storage_key:
+        row = (
+            supabase.table("resume_uploads")
+            .select("storage_key, filename")
+            .eq("job_id", job_id)
+            .eq("file_hash", body.file_hash)
+            .limit(1)
+            .execute()
+            .data
+        )
+        if not row:
+            raise HTTPException(404, "Upload not found for this file_hash")
+        storage_key = row[0]["storage_key"]
+        filename_hint = row[0].get("filename")
+
+    try:
+        data = _download_from_storage(storage_key)
+        pdf_text = _extract_text_pdf(data)
+    except Exception as e:
+        # store error and return
+        supabase.table("resume_uploads").update(
+            {"last_error": f"download/parse failed: {e}"}
+        ).eq("job_id", job_id).eq("storage_key", storage_key).execute()
+        raise HTTPException(400, f"Download/parse failed: {e}")
+
+    # infer email from filename if possible
+    email_hint = body.email_hint
+    if not email_hint:
+        fn = filename_hint or storage_key.split("/", 1)[-1]
+        m = re.search(r"([\w\.-]+@[\w\.-]+\.\w+)", fn or "")
+        if m:
+            email_hint = m.group(1)
+
+    _insert_or_update_resume(job, pdf_text, email_hint)
+
+    supabase.table("resume_uploads").update(
+        {"parsed_at": datetime.datetime.utcnow().isoformat() + "Z", "last_error": None}
+    ).eq("job_id", job_id).eq("storage_key", storage_key).execute()
+
+    return {"status": "ok", "storage_key": storage_key}
+
+@app.post("/jobs/{job_id}/parse_pending")
+async def parse_pending(
+    job_id: str,
+    limit: int = Query(100, ge=1, le=500),
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    job = _get_job_owned(job_id, current_user)
+    # fetch unparsed uploads
+    pending = (
+        supabase.table("resume_uploads")
+        .select("storage_key, filename")
+        .eq("job_id", job_id)
+        .is_("parsed_at", "null")  # supabase-py supports .is_ for IS NULL
+        .limit(limit)
+        .execute()
+        .data
+        or []
+    )
+
+    parsed, errors = 0, []
+
+    for row in pending:
+        key = row["storage_key"]
+        try:
+            data = _download_from_storage(key)
+            pdf_text = _extract_text_pdf(data)
+
+            # filename-based email hint
+            email_hint = None
+            m = re.search(r"([\w\.-]+@[\w\.-]+\.\w+)", (row.get("filename") or key) )
+            if m:
+                email_hint = m.group(1)
+
+            _insert_or_update_resume(job, pdf_text, email_hint)
+
+            supabase.table("resume_uploads").update(
+                {"parsed_at": datetime.datetime.utcnow().isoformat() + "Z", "last_error": None}
+            ).eq("job_id", job_id).eq("storage_key", key).execute()
+            parsed += 1
+
+        except Exception as e:
+            msg = f"{key}: {e}"
+            errors.append(msg)
+            supabase.table("resume_uploads").update(
+                {"last_error": msg}
+            ).eq("job_id", job_id).eq("storage_key", key).execute()
+
+    return {"status": "ok", "parsed": parsed, "errors": errors, "remaining_estimate": max(0, len(pending) - parsed)}
+
+
+def _insert_or_update_resume(job: dict, pdf_text: str, email_hint: Optional[str]):
+    # ---- email (unchanged) ----
+    m = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", pdf_text or "")
+    email = (email_hint or "").strip().lower() or (m.group(0).lower() if m else None)
+    if not email:
+        email = hashlib.sha1((pdf_text or "")[:200].encode("utf-8")).hexdigest()[:16] + "@noemail.local"
+
+    # ---- skills arrays may be json strings in your DB – handle both (unchanged) ----
+    must = _safe_json_list(job.get("skills_must_have"))
+    nice = _safe_json_list(job.get("skills_nice_to_have"))
+
+    # ---- keep your existing scoring exactly as-is ----
+    scored = _score(pdf_text or "", must, nice, job.get("min_years"), job.get("max_years"))
+    meta = scored["meta"]
+    jd_match = scored["jd_match_score"]
+
+    # ---- NEW: LLM parse for richer candidate/resume fields (not used for scoring) ----
+    cand = parse_resume_structured(pdf_text)  # dict: names, links, skills, experience, etc.
+
+    # ---- upsert candidate (email unique) with richer fields ----
+    supabase.table("candidates").upsert(
+        {
+            "email": email,
+            "first_name": cand.get("first_name"),
+            "last_name": cand.get("last_name"),
+            "full_name": cand.get("full_name"),
+            "phone": cand.get("phone"),
+            "location": cand.get("location"),
+            "links": cand.get("links") or {},
+        },
+        on_conflict="email",
+    ).execute()
+    cand_row = supabase.table("candidates").select("candidate_id").eq("email", email).execute().data
+    candidate_id = cand_row and cand_row[0].get("candidate_id")
+    # gather job skill lists in Python form
+    must = _safe_json_list(job.get("skills_must_have"))
+    nice = _safe_json_list(job.get("skills_nice_to_have"))
+
+    # ... after you compute meta/jd_match and cand ...
+    ai_analysis = generate_resume_analysis(
+        cand,
+        meta,
+        job.get("jd_text") or "",
+        job.get("role"),
+        must,
+        nice,
+        job.get("min_years"),
+        job.get("max_years"),
+    )
+
+
+    # ---- upsert resume row (unique: job_id + email) ----
+    supabase.table("resumes").upsert(
+        {
+            "job_id": job["job_id"],
+            "candidate_id": candidate_id,
+            "email": email,
+            "status": "PARSED",
+
+            # structured fields from parser
+            "first_name": cand.get("first_name"),
+            "last_name": cand.get("last_name"),
+            "full_name": cand.get("full_name"),
+            "phone": cand.get("phone"),
+            "location": cand.get("location"),
+            "links": cand.get("links") or {},
+            "skills": cand.get("skills") or {},
+            "experience": cand.get("experience") or [],
+            "education": cand.get("education") or [],
+            "projects": cand.get("projects") or [],
+            "certifications": cand.get("certifications") or [],
+
+            # keep your existing meta + scores
+            "meta": meta,
+            "raw_text": pdf_text,
+            "role": job.get("role"),
+            "ai_summary": ai_analysis,
+            "jd_match_score": jd_match,
+            "skill_match_score": meta.get("skill_match_score"),
+            "experience_match_score": meta.get("experience_match_score"),
+            "education_match_score": meta.get("education_score", 0),
+        },
+        on_conflict="job_id,email",
+    ).execute()
+
+def _ensure_company(user: UserIdentity) -> Dict[str, Any]:
+    rec = (
+        supabase.table("recruiters")
+        .select("company_id")
+        .eq("user_id", user.user_id)
+        .single()
+        .execute()
+        .data
+    )
+    if not rec:
+        raise HTTPException(400, "Please create company profile first")
+    return rec
+
+@app.get("/jobs/{job_id}/ranked")
+async def ranked(job_id: str, limit: int = Query(50, ge=1, le=200), current_user: UserIdentity = Depends(get_current_user)):
+    _ = _get_job_owned(job_id, current_user)  # verify ownership
+    rows = (
+        supabase.table("resumes")
+        .select("*")
+        .eq("job_id", job_id)
+        .order("jd_match_score", desc=True)
+        .limit(limit)
+        .execute()
+        .data
+    )
+    return {"job_id": job_id, "count": len(rows), "rows": rows}
+
+@app.post("/jobs/{job_id}/rescore_existing")
+async def rescore_existing(job_id: str, current_user: UserIdentity = Depends(get_current_user)):
+    job = _get_job_owned(job_id, current_user)
+    must = _safe_json_list(job.get("skills_must_have"))
+    nice = _safe_json_list(job.get("skills_nice_to_have"))
+
+    res = (
+        supabase.table("resumes")
+        .select("resume_id, raw_text")
+        .eq("job_id", job_id)
+        .execute()
+        .data
+        or []
+    )
+    updated = 0
+    for r in res:
+        scored = _score(r.get("raw_text") or "", must, nice, job.get("min_years"), job.get("max_years"))
+        meta = scored["meta"]; jd_match = scored["jd_match_score"]
+
+        # reparse candidate (small cost, keeps analysis fresh)
+        cand = parse_resume_structured(r.get("raw_text") or "")
+        ai_analysis = generate_resume_analysis(
+            cand,
+            meta,
+            job.get("jd_text") or "",
+            job.get("role"),
+            must,
+            nice,
+            job.get("min_years"),
+            job.get("max_years"),
+        )
+
+        supabase.table("resumes").update(
+            {
+                "jd_match_score": jd_match,
+                "skill_match_score": meta.get("skill_match_score"),
+                "experience_match_score": meta.get("experience_match_score"),
+                "meta": meta,
+                "ai_summary": ai_analysis,   # keep UI up to date
+            }
+        ).eq("resume_id", r["resume_id"]).execute()
+        updated += 1
+
+    return {"status": "ok", "rescored": updated}
+
+
+@app.post("/storage/cleanup")
+async def cleanup(current_user: UserIdentity = Depends(get_current_user)):
+    now = datetime.datetime.utcnow().isoformat() + "Z"
+    expired = supabase.table("resume_uploads").select("*").lt("expires_at", now).execute().data or []
+    bucket = supabase.storage.from_(RESUME_BUCKET)
+    deleted = 0
+    for row in expired:
+        try:
+            bucket.remove([row["storage_key"]])
+        except Exception:
+            pass
+        supabase.table("resume_uploads").delete().eq("job_id", row["job_id"]).eq("file_hash", row["file_hash"]).execute()
+        deleted += 1
+    return {"deleted": deleted}
+
+@app.post("/jobs/{job_id}/upload_resumes")
+async def upload_resumes(
+    job_id: str,
+    files: List[UploadFile] = File(...),
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    job = _get_job_owned(job_id, current_user)
+
+    if not files:
+        raise HTTPException(400, "No files provided")
+
+    results = []
+    for f in files:
+        try:
+            data = await f.read()
+            if not data:
+                results.append({"file_name": f.filename, "status": "skipped_empty"})
+                continue
+
+            ct = (f.content_type or "").lower()
+            is_pdf_ct = ct in ("application/pdf", "application/octet-stream", "binary/octet-stream")
+            is_pdf_magic = data[:5] == b"%PDF-"
+            if not (is_pdf_ct or is_pdf_magic):
+                results.append({
+                    "file_name": f.filename,
+                    "status": "skipped_invalid_type",
+                    "reason": f"Not a PDF (content_type={f.content_type})"
+                })
+                continue
+
+            sha = _sha256_bytes(data)
+            exists = (
+                supabase.table("resume_uploads")
+                .select("storage_key")
+                .eq("job_id", job_id)
+                .eq("file_hash", sha)
+                .execute()
+                .data
+            )
+            if exists:
+                results.append({
+                    "file_name": f.filename,
+                    "file_hash": sha,
+                    "storage_key": exists[0]["storage_key"],
+                    "status": "duplicate"
+                })
+                continue
+
+            storage_key = _upload_to_storage(job_id, sha, f.filename or "resume.pdf", data)
+            expires_at = (datetime.datetime.utcnow() + datetime.timedelta(hours=RESUME_TTL_HOURS)).isoformat() + "Z"
+
+            supabase.table("resume_uploads").upsert(
+                {
+                    "job_id": job_id,
+                    "file_hash": sha,
+                    "storage_key": storage_key,
+                    "uploader_id": current_user.user_id,
+                    "expires_at": expires_at,
+                    "parsed_at": None,
+                    "filename": f.filename,
+                    "content_type": f.content_type,
+                    "last_error": None,
+                },
+                on_conflict="job_id,file_hash",
+            ).execute()
+
+            results.append({"file_name": f.filename, "file_hash": sha, "storage_key": storage_key, "status": "ok"})
+
+        except Exception as e:
+            results.append({"file_name": getattr(f, "filename", None), "status": "error", "reason": str(e)})
+
+    return {"status": "ok", "count": len(results), "results": results}
+
+@app.get("/jobs/{job_id}/resumes")
+async def list_resumes(
+    job_id: str,
+    status: Optional[str] = Query(None, description="Filter by status: PENDING | PARSED | REJECTED"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    """
+    List resumes for a job with optional status filter and simple pagination.
+    - Sorts by jd_match_score DESC, created_at DESC (if present).
+    - Returns total count (for client-side paging) and next_offset cursor.
+    """
+    # Ownership check
+    _ = _get_job_owned(job_id, current_user)
+
+    # Validate status (if provided)
+    if status is not None and status not in ALLOWED_RESUME_STATUSES:
+        raise HTTPException(status_code=400, detail=f"Invalid status. Use one of {sorted(ALLOWED_RESUME_STATUSES)}")
+
+    q = (
+        supabase.table("resumes")
+        .select("*", count="exact")
+        .eq("job_id", job_id)
+    )
+    if status:
+        q = q.eq("status", status)
+
+    # Primary sort by match score, fallback by created_at if you have that column
+    # Supabase allows multiple .order(...) calls
+    q = q.order("jd_match_score", desc=True)
+    try:
+        q = q.order("created_at", desc=True)  # safe if column exists; otherwise ignore/remove
+    except Exception:
+        pass
+
+    # Pagination
+    # Supabase "range" is inclusive on both ends
+    end = offset + limit - 1
+    q = q.range(offset, end)
+
+    resp = q.execute()
+    rows = resp.data or []
+    total = getattr(resp, "count", None)
+
+    # next_offset-style cursor
+    next_offset = None
+    if len(rows) == limit:
+        next_offset = offset + limit
+
+    return {
+        "job_id": job_id,
+        "status_filter": status or "ANY",
+        "total": total,           # may be None on older libs; if so, omit in UI
+        "limit": limit,
+        "offset": offset,
+        "next_offset": next_offset,
+        "rows": rows,
+    }
+
+# ===================== INTERVIEWERS CRUD =====================
+
+# Create
+@app.post("/interviewers", response_model=InterviewerOut)
+async def invite_interviewer(
+    body: InterviewerInvite,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    rec = _ensure_company(current_user)
+    company_id = rec["company_id"]
+
+    # enforce uniqueness per company
+    existing = (
+        supabase.table("interviewers")
+        .select("interviewer_id")
+        .eq("company_id", company_id)
+        .eq("email", body.email.lower())
+        .limit(1)
+        .execute()
+        .data
+    )
+    if existing:
+        raise HTTPException(409, "Interviewer with this email already exists in this company")
+
+    admin = supabase.auth.admin
+
+    # 1) Send an invite email (Supabase sends it via SMTP)
+    # NOTE: 'options' shape varies with library versions, we handle both.
+    try:
+        invited = admin.invite_user_by_email(
+            body.email.lower(),
+            { "redirect_to": INVITE_REDIRECT }
+        )
+    except Exception:
+        # older signatures sometimes use 'data' kw; this keeps it robust
+        invited = admin.invite_user_by_email(body.email.lower(), {"redirect_to": INVITE_REDIRECT})
+
+    auth_user_id = invited.user.id
+
+    # 2) Set metadata (invite API only sets user_metadata by default)
+    admin.update_user_by_id(auth_user_id, {
+        "app_metadata":  {"role": "interviewer", "company_id": company_id},
+        "user_metadata": {"name": body.name},
+    })
+
+    # 3) Insert your shadow row
+    row = (
+        supabase.table("interviewers")
+        .insert({
+            "company_id": company_id,
+            "auth_user_id": auth_user_id,
+            "name": body.name.strip(),
+            "email": body.email.lower(),
+            "is_active": bool(body.is_active),
+            "created_by": current_user.user_id,
+        })
+        .execute()
+        .data[0]
+    )
+
+    return {
+        "interviewer_id": row["interviewer_id"],
+        "name": row["name"],
+        "email": row["email"],
+        "company_id": row.get("company_id"),
+        "is_active": row.get("is_active", True),
+    }
+
+
+
+@app.get("/interviewers", response_model=List[InterviewerOut])
+async def list_interviewers(
+    q: Optional[str] = Query(None, description="search by name/email"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    company_id = _get_company_id_for_user(current_user)
+    if not company_id:
+        raise HTTPException(400, "Please create company profile first")
+
+    query = (
+        supabase.table("interviewers")
+        .select("interviewer_id, name, email, company_id, is_active")
+        .eq("company_id", company_id)
+        .eq("is_active", True)
+    )
+
+    # Optional order if column exists
+    try:
+        query = query.order("created_at", desc=True)
+    except Exception:
+        pass
+
+    if q:
+        # Search both name and email (PostgREST OR syntax)
+        try:
+            query = query.or_(f"email.ilike.%{q}%,name.ilike.%{q}%")
+        except Exception:
+            # Minimal fallback: filter by email only
+            query = query.filter("email", "ilike", f"%{q}%")
+
+    end = offset + limit - 1
+    rows = query.range(offset, end).execute().data or []
+    return [
+        {
+            "interviewer_id": r["interviewer_id"],
+            "name": r["name"],
+            "email": r["email"],
+            "company_id": r.get("company_id"),
+            "is_active": r.get("is_active", True),
+        }
+        for r in rows
+    ]
+
+# Read one
+@app.get("/interviewers/{interviewer_id}", response_model=InterviewerOut)
+async def get_interviewer(
+    interviewer_id: str,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    company_id = _get_company_id_for_user(current_user)
+    row = (
+        supabase.table("interviewers")
+        .select("interviewer_id, name, email, company_id, is_active")
+        .eq("interviewer_id", interviewer_id)
+        .eq("company_id", company_id)
+        .single()
+        .execute()
+        .data
+    )
+    if not row:
+        raise HTTPException(404, "Interviewer not found")
+    return row
+
+
+# Update
+@app.put("/interviewers/{interviewer_id}", response_model=InterviewerOut)
+async def update_interviewer(
+    interviewer_id: str,
+    body: InterviewerUpdate,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    rec = _ensure_company(current_user)
+    company_id = rec["company_id"]
+
+    # 1) Fetch current row to get auth_user_id
+    existing = (
+        supabase.table("interviewers")
+        .select("interviewer_id, auth_user_id, name, email, company_id, is_active")
+        .eq("interviewer_id", interviewer_id)
+        .eq("company_id", company_id)
+        .single()
+        .execute()
+        .data
+    )
+    if not existing:
+        raise HTTPException(404, "Interviewer not found")
+
+    updates: Dict[str, Any] = {}
+    if body.name is not None:
+        updates["name"] = body.name.strip()
+    if body.email is not None:
+        updates["email"] = body.email.lower()
+    if body.is_active is not None:
+        updates["is_active"] = bool(body.is_active)
+
+    if not updates:
+        return existing  # nothing to do
+
+    # 2) Update Auth user (only if name/email changed)
+    admin = supabase.auth.admin
+    auth_updates: Dict[str, Any] = {}
+    if "name" in updates:
+        auth_updates.setdefault("user_metadata", {})["name"] = updates["name"]
+    if "email" in updates:
+        auth_updates["email"] = updates["email"]
+
+    if auth_updates:
+        admin.update_user_by_id(existing["auth_user_id"], auth_updates)
+
+    # 3) Update your row
+    row = (
+        supabase.table("interviewers")
+        .update(updates)
+        .eq("interviewer_id", interviewer_id)
+        .eq("company_id", company_id)
+        .execute()
+        .data[0]
+    )
+    return {
+        "interviewer_id": row["interviewer_id"],
+        "name": row["name"],
+        "email": row["email"],
+        "company_id": row.get("company_id"),
+        "is_active": row.get("is_active", True),
+    }
+
+@app.post("/interviewers/{interviewer_id}/deactivate")
+async def deactivate_interviewer(
+    interviewer_id: str,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    rec = _ensure_company(current_user)
+    company_id = rec["company_id"]
+
+    row = (
+        supabase.table("interviewers")
+        .select("auth_user_id")
+        .eq("interviewer_id", interviewer_id)
+        .eq("company_id", company_id)
+        .single()
+        .execute()
+        .data
+    )
+    if not row:
+        raise HTTPException(404, "Interviewer not found")
+
+    admin = supabase.auth.admin
+    # Mark blocked in app_metadata (enforce in RLS or app logic)
+    admin.update_user_by_id(row["auth_user_id"], {"app_metadata": {"blocked": True}})
+    supabase.table("interviewers").update({"is_active": False}).eq("interviewer_id", interviewer_id).execute()
+    return {"message": "Interviewer deactivated"}
+
+@app.post("/interviewers/{interviewer_id}/reactivate")
+async def reactivate_interviewer(
+    interviewer_id: str,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    rec = _ensure_company(current_user)
+    company_id = rec["company_id"]
+
+    row = (
+        supabase.table("interviewers")
+        .select("auth_user_id")
+        .eq("interviewer_id", interviewer_id)
+        .eq("company_id", company_id)
+        .single()
+        .execute()
+        .data
+    )
+    if not row:
+        raise HTTPException(404, "Interviewer not found")
+
+    admin = supabase.auth.admin
+    admin.update_user_by_id(row["auth_user_id"], {"app_metadata": {"blocked": False}})
+    supabase.table("interviewers").update({"is_active": True}).eq("interviewer_id", interviewer_id).execute()
+    return {"message": "Interviewer reactivated"}
+
+
+@app.delete("/interviewers/{interviewer_id}")
+async def delete_interviewer(
+    interviewer_id: str,
+    hard: bool = Query(False, description="set true to hard delete"),
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    rec = _ensure_company(current_user)
+    company_id = rec["company_id"]
+
+    row = (
+        supabase.table("interviewers")
+        .select("auth_user_id")
+        .eq("interviewer_id", interviewer_id)
+        .eq("company_id", company_id)
+        .single()
+        .execute()
+        .data
+    )
+    if not row:
+        raise HTTPException(404, "Interviewer not found")
+
+    if hard:
+        supabase.auth.admin.delete_user(row["auth_user_id"])
+        supabase.table("interviewers").delete().eq("interviewer_id", interviewer_id).eq("company_id", company_id).execute()
+        return {"message": "Interviewer deleted", "hard": True}
+
+    # soft delete
+    supabase.table("interviewers").update({"is_active": False}).eq("interviewer_id", interviewer_id).eq("company_id", company_id).execute()
+    supabase.auth.admin.update_user_by_id(row["auth_user_id"], {"app_metadata": {"blocked": True}})
+    return {"message": "Interviewer deactivated", "hard": False}
+
+@app.post("/interviewers/{interviewer_id}/send-reset", response_model=SendResetOut)
+async def send_reset_link(
+    interviewer_id: str,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    rec = _ensure_company(current_user)
+    company_id = rec["company_id"]
+
+    row = (
+        supabase.table("interviewers")
+        .select("email")
+        .eq("interviewer_id", interviewer_id)
+        .eq("company_id", company_id)
+        .single()
+        .execute()
+        .data
+    )
+    if not row:
+        raise HTTPException(404, "Interviewer not found")
+
+    email = row["email"].lower()
+
+    # supabase-py differs by version; try the common names in order
+    try:
+        supabase.auth.reset_password_for_email(email, options={"redirect_to": RESET_REDIRECT})
+    except AttributeError:
+        try:
+            supabase.auth.reset_password_for_email(email, {"redirect_to": RESET_REDIRECT})
+        except Exception:
+            # fallback name in some builds
+            supabase.auth.reset_password_email(email, {"redirect_to": RESET_REDIRECT})
+
+    # For UX, return a generic message; the actual email is sent by Supabase.
+    return {"action_link": f"(email sent) redirect_to={RESET_REDIRECT}"}
 
 # ---------------------------------------------------------------------------
 # run (local)
@@ -807,6 +1913,3 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
-
-
-
