@@ -1903,10 +1903,7 @@ async def delete_interviewer(
     return {"message": "Interviewer deactivated", "hard": False}
 
 @app.post("/interviewers/{interviewer_id}/send-reset", response_model=SendResetOut)
-async def send_reset_link(
-    interviewer_id: str,
-    current_user: UserIdentity = Depends(get_current_user),
-):
+async def send_reset_link(interviewer_id: str, current_user: UserIdentity = Depends(get_current_user)):
     rec = _ensure_company(current_user)
     company_id = rec["company_id"]
 
@@ -1923,16 +1920,13 @@ async def send_reset_link(
         raise HTTPException(404, "Interviewer not found")
 
     email = row["email"].lower()
-
-    # Use the public client for password reset emails
     try:
         public_sb.auth.reset_password_for_email(email, options={"redirect_to": RESET_REDIRECT})
     except AttributeError:
         public_sb.auth.reset_password_for_email(email, {"redirect_to": RESET_REDIRECT})
 
-
-        # For UX, return a generic message; the actual email is sent by Supabase.
-        return {"action_link": f"(email sent) redirect_to={RESET_REDIRECT}"}
+    # <-- return must be outside the try/except
+    return {"action_link": f"(email sent) redirect_to={RESET_REDIRECT}"}
 
 @app.post("/auth/interviewer/signin", response_model=InterviewerSessionOut)
 async def interviewer_signin(body: InterviewerSignIn):
