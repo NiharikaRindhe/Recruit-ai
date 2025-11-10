@@ -11,7 +11,8 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 import jwt
 import requests
-
+# imports (near the top)
+from supabase.client import ClientOptions
 import hashlib
 import datetime
 import fitz  # PyMuPDF
@@ -75,7 +76,31 @@ SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in environment")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+# BEFORE
+# supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+# AFTER
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")  # <- add this
+if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in environment")
+if not SUPABASE_ANON_KEY:
+    raise RuntimeError("Missing SUPABASE_ANON_KEY in environment")
+
+admin_sb: Client = create_client(
+    SUPABASE_URL,
+    SUPABASE_SERVICE_KEY,
+    options=ClientOptions(auto_refresh_token=False, persist_session=False),
+)
+
+public_sb: Client = create_client(
+    SUPABASE_URL,
+    SUPABASE_ANON_KEY,
+    options=ClientOptions(auto_refresh_token=False, persist_session=False),
+)
+
+# Keep all your DB/storage code working without edits:
+supabase: Client = admin_sb
+
 INVITE_REDIRECT = os.getenv("INTERVIEWER_INVITE_REDIRECT")
 RESET_REDIRECT  = os.getenv("PASSWORD_RESET_REDIRECT")
 # ---------- NEW: storage + TTL settings ----------
@@ -496,7 +521,7 @@ async def root():
 @app.post("/auth/signup")
 async def signup(request: SignUpRequest):
     try:
-        resp = supabase.auth.sign_up({"email": request.email, "password": request.password})
+        resp = public_sb.auth.sign_up({"email": request.email, "password": request.password})
         if resp.user:
             return {"message": "User created successfully", "user": {"id": resp.user.id, "email": resp.user.email}}
         raise HTTPException(status_code=400, detail="Failed to create user")
@@ -506,7 +531,7 @@ async def signup(request: SignUpRequest):
 @app.post("/auth/signin")
 async def signin(request: SignInRequest):
     try:
-        resp = supabase.auth.sign_in_with_password({"email": request.email, "password": request.password})
+        resp = public_sb.auth.sign_in_with_password({"email": request.email, "password": request.password})
         if resp.session:
             return {
                 "access_token": resp.session.access_token,
@@ -976,7 +1001,7 @@ def _ollama_generate(prompt: str) -> str:
     return generate_jd_with_ollama(prompt)
 
 # Prompts
-ALLOWED_RESUME_STATUSES = {"PENDING", "PARSED", "REJECTED"}
+ALLOWED_RESUME_STATUSES = {"PENDING", "PARSED", "REJECTED","SHORTLISTED"}
 
 EXTRACT_PROMPT = (
     "You are a resume parsing assistant. Return ONLY JSON with these exact top-level keys: "
@@ -1621,7 +1646,7 @@ async def invite_interviewer(
     if existing:
         raise HTTPException(409, "Interviewer with this email already exists in this company")
 
-    admin = supabase.auth.admin
+    admin = admin_sb.auth.admin
 
     # 1) Send an invite email (Supabase sends it via SMTP)
     # NOTE: 'options' shape varies with library versions, we handle both.
@@ -1767,7 +1792,7 @@ async def update_interviewer(
         return existing  # nothing to do
 
     # 2) Update Auth user (only if name/email changed)
-    admin = supabase.auth.admin
+    admin = admin_sb.auth.admin
     auth_updates: Dict[str, Any] = {}
     if "name" in updates:
         auth_updates.setdefault("user_metadata", {})["name"] = updates["name"]
@@ -1814,7 +1839,7 @@ async def deactivate_interviewer(
     if not row:
         raise HTTPException(404, "Interviewer not found")
 
-    admin = supabase.auth.admin
+    admin = admin_sb.auth.admin
     # Mark blocked in app_metadata (enforce in RLS or app logic)
     admin.update_user_by_id(row["auth_user_id"], {"app_metadata": {"blocked": True}})
     supabase.table("interviewers").update({"is_active": False}).eq("interviewer_id", interviewer_id).execute()
@@ -1840,7 +1865,7 @@ async def reactivate_interviewer(
     if not row:
         raise HTTPException(404, "Interviewer not found")
 
-    admin = supabase.auth.admin
+    admin = admin_sb.auth.admin
     admin.update_user_by_id(row["auth_user_id"], {"app_metadata": {"blocked": False}})
     supabase.table("interviewers").update({"is_active": True}).eq("interviewer_id", interviewer_id).execute()
     return {"message": "Interviewer reactivated"}
@@ -1899,26 +1924,21 @@ async def send_reset_link(
 
     email = row["email"].lower()
 
-    # supabase-py differs by version; try the common names in order
+    # Use the public client for password reset emails
     try:
-        supabase.auth.reset_password_for_email(email, options={"redirect_to": RESET_REDIRECT})
+        public_sb.auth.reset_password_for_email(email, options={"redirect_to": RESET_REDIRECT})
     except AttributeError:
-        try:
-            supabase.auth.reset_password_for_email(email, {"redirect_to": RESET_REDIRECT})
-        except Exception:
-            # fallback name in some builds
-            supabase.auth.reset_password_email(email, {"redirect_to": RESET_REDIRECT})
+        public_sb.auth.reset_password_for_email(email, {"redirect_to": RESET_REDIRECT})
 
-    # For UX, return a generic message; the actual email is sent by Supabase.
-    return {"action_link": f"(email sent) redirect_to={RESET_REDIRECT}"}
+
+        # For UX, return a generic message; the actual email is sent by Supabase.
+        return {"action_link": f"(email sent) redirect_to={RESET_REDIRECT}"}
 
 @app.post("/auth/interviewer/signin", response_model=InterviewerSessionOut)
 async def interviewer_signin(body: InterviewerSignIn):
     try:
         # 1) sign in with email/password
-        resp = supabase.auth.sign_in_with_password(
-            {"email": body.email, "password": body.password}
-        )
+        resp = public_sb.auth.sign_in_with_password({"email": body.email, "password": body.password})
         if not resp.session or not resp.user:
             raise HTTPException(status_code=401, detail="Invalid credentials")
 
