@@ -1,6 +1,12 @@
 import os
 import re
 import json
+# OAuth & HTTP
+import base64, secrets, hashlib
+from urllib.parse import urlencode
+import httpx
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,8 +19,9 @@ import jwt
 import requests
 # imports (near the top)
 from supabase.client import ClientOptions
-import hashlib
 import datetime
+from fastapi import Request
+from fastapi.responses import RedirectResponse
 import fitz  # PyMuPDF
 # Safe import for different storage3 versions
 try:
@@ -68,6 +75,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+OAUTH_REDIRECT_URI = os.getenv("OAUTH_REDIRECT_URI")
+FRONTEND_SUCCESS_URL = os.getenv("FRONTEND_SUCCESS_URL", "https://recruit-ai-gms.netlify.app")
+GOOGLE_SCOPES = ["https://www.googleapis.com/auth/calendar"]
+
 # ---------------------------------------------------------------------------
 # Supabase
 # ---------------------------------------------------------------------------
@@ -112,9 +126,7 @@ RESUME_TTL_HOURS = int(os.getenv("RESUME_TTL_HOURS", "36"))
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "https://ollama.com/api")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
-# ---------------------------------------------------------------------------
-# Security
-# ---------------------------------------------------------------------------
+
 security = HTTPBearer()
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -199,6 +211,15 @@ class BulkShortlistRequest(BaseModel):
     resume_ids: Optional[List[str]] = None          # shortlist by resume_id(s)
     emails: Optional[List[EmailStr]] = None         # or by candidate email(s)
     only_if_status: str = "PARSED"                  # safety: only update when current status == PARSED
+
+class ScheduleInterviewIn(BaseModel):
+    job_id: str
+    resume_id: str
+    interviewer_id: str
+    start_iso: str
+    end_iso: str
+    timezone: str = "Asia/Kolkata"
+    external_id: Optional[str] = None  # for idempotency
 
 # ---------------------------------------------------------------------------
 # Auth helpers
@@ -510,6 +531,61 @@ def _get_company_id_for_user(user: UserIdentity) -> Optional[str]:
     )
     return rec[0]["company_id"] if rec else None
 
+def _pkce_challenge(verifier: str) -> str:
+    dig = hashlib.sha256(verifier.encode()).digest()
+    return base64.urlsafe_b64encode(dig).rstrip(b"=").decode()
+
+def _save_google_tokens(user_id: str, token: dict):
+    # upsert token for this user
+    supabase.table("google_oauth_tokens").upsert({
+        "user_id": user_id,
+        "refresh_token": token.get("refresh_token"),
+        "access_token": token.get("access_token"),
+        "token_expiry": datetime.datetime.utcfromtimestamp(
+            datetime.datetime.utcnow().timestamp() + int(token.get("expires_in", 3600))
+        ).isoformat() + "Z",
+        "scope": token.get("scope"),
+        "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
+    }).execute()
+
+def _get_google_refresh_token(user_id: str) -> str | None:
+    rows = (
+        supabase.table("google_oauth_tokens")
+        .select("refresh_token")
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+        .data
+    )
+    return rows[0]["refresh_token"] if rows else None
+
+
+def _google_service_for_user(user_id: str):
+    rtok = _get_google_refresh_token(user_id)
+    if not rtok:
+        raise HTTPException(400, "Google is not connected for this account")
+
+    creds = Credentials(
+        token=None,
+        refresh_token=rtok,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        scopes=GOOGLE_SCOPES,
+    )
+    # optional proactive refresh
+    # creds.refresh(GARequest())
+    return build("calendar", "v3", credentials=creds, cache_discovery=False)
+
+def _first_row(resp):
+    """Works across supabase-py versions: returns the first row or None."""
+    if resp is None:
+        return None
+    data = getattr(resp, "data", None)
+    if isinstance(data, list):
+        return data[0] if data else None
+    return data  # may already be a dict or None
+
 # ---------------------------------------------------------------------------
 # routes (YOUR ORIGINAL ROUTES — UNCHANGED)
 # ---------------------------------------------------------------------------
@@ -541,6 +617,102 @@ async def signin(request: SignInRequest):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid email or password")
+
+# Start OAuth (must be called by a logged-in user)
+@app.get("/auth/google/start")
+async def google_start(current_user: UserIdentity = Depends(get_current_user)):
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET or not OAUTH_REDIRECT_URI:
+        raise HTTPException(500, "Google OAuth not configured")
+
+    # PKCE + state
+    state = secrets.token_urlsafe(24)
+    verifier = secrets.token_urlsafe(64)
+    challenge = _pkce_challenge(verifier)
+
+# in google_start()
+    IS_LOCAL = os.getenv("ENV", "local").lower() == "local"
+    SAMESITE = "Lax" if IS_LOCAL else "None"
+    SECURE   = not IS_LOCAL
+
+    # in google_start()
+    resp.set_cookie("g_state",    state,    httponly=True, samesite=SAMESITE, secure=SECURE)
+    resp.set_cookie("g_verifier", verifier, httponly=True, samesite=SAMESITE, secure=SECURE)
+    resp.set_cookie("sb_uid",     current_user.user_id, httponly=True, samesite=SAMESITE, secure=SECURE)
+    # or use an env check like os.getenv("ENV") == "local"
+
+    resp = RedirectResponse(url="/auth/google/go")
+    return resp
+
+
+@app.get("/auth/google/go")
+def google_go(request: Request):
+    state = request.cookies.get("g_state")
+    verifier = request.cookies.get("g_verifier")
+    if not state or not verifier:
+        raise HTTPException(400, "Missing PKCE cookies")
+
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": OAUTH_REDIRECT_URI,
+        "response_type": "code",
+        "scope": " ".join(GOOGLE_SCOPES),
+        "state": state,
+        "access_type": "offline",   # get refresh token
+        "prompt": "consent",        # ensure refresh token even if previously consented
+        "code_challenge": _pkce_challenge(verifier),
+        "code_challenge_method": "S256",
+    }
+    url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
+    return RedirectResponse(url)
+
+# Google's redirect URI (MUST match in Google console)
+@app.get("/oauth2/callback")
+async def oauth_callback(request: Request, code: str, state: str):
+    st = request.cookies.get("g_state")
+    verifier = request.cookies.get("g_verifier")
+    user_id = request.cookies.get("sb_uid")
+    if not st or st != state or not verifier or not user_id:
+        raise HTTPException(400, "Invalid state or session")
+
+    data = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "code": code,
+        "code_verifier": verifier,
+        "grant_type": "authorization_code",
+        "redirect_uri": OAUTH_REDIRECT_URI,
+    }
+    async with httpx.AsyncClient() as client:
+        r = await client.post("https://oauth2.googleapis.com/token", data=data, timeout=30)
+
+    try:
+        token = r.json()
+    except Exception:
+        raise HTTPException(400, f"Token HTTP {r.status_code}: {r.text}")
+
+    if "error" in token:
+        # surfaces 'invalid_client', 'redirect_uri_mismatch', etc.
+        raise HTTPException(400, f"Google token error: {token.get('error')} - {token.get('error_description')}")
+
+    saved_rt = _get_google_refresh_token(user_id)
+    if "refresh_token" not in token:
+        if saved_rt:
+            token["refresh_token"] = saved_rt
+        else:
+            raise HTTPException(400, "Missing refresh_token (ask user to check 'consent' and offline access)")
+
+    _save_google_tokens(user_id, token)
+
+    # clean cookies and send back to frontend
+    resp = RedirectResponse(url=FRONTEND_SUCCESS_URL)
+    resp.delete_cookie("g_state")
+    resp.delete_cookie("g_verifier")
+    resp.delete_cookie("sb_uid")
+    return resp
+
+@app.get("/auth/google/status")
+def google_status(current_user: UserIdentity = Depends(get_current_user)):
+    return {"connected": bool(_get_google_refresh_token(current_user.user_id))}
 
 # ---------- me ----------
 @app.get("/me")
@@ -1315,7 +1487,6 @@ async def parse_pending(
 
     return {"status": "ok", "parsed": parsed, "errors": errors, "remaining_estimate": max(0, len(pending) - parsed)}
 
-
 def _insert_or_update_resume(job: dict, pdf_text: str, email_hint: Optional[str]):
     # ---- email (unchanged) ----
     m = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", pdf_text or "")
@@ -1365,7 +1536,6 @@ def _insert_or_update_resume(job: dict, pdf_text: str, email_hint: Optional[str]
         job.get("min_years"),
         job.get("max_years"),
     )
-
 
     # ---- upsert resume row (unique: job_id + email) ----
     supabase.table("resumes").upsert(
@@ -1472,7 +1642,6 @@ async def rescore_existing(job_id: str, current_user: UserIdentity = Depends(get
         updated += 1
 
     return {"status": "ok", "rescored": updated}
-
 
 @app.post("/storage/cleanup")
 async def cleanup(current_user: UserIdentity = Depends(get_current_user)):
@@ -1690,8 +1859,6 @@ async def invite_interviewer(
         "is_active": row.get("is_active", True),
     }
 
-
-
 @app.get("/interviewers", response_model=List[InterviewerOut])
 async def list_interviewers(
     q: Optional[str] = Query(None, description="search by name/email"),
@@ -1755,7 +1922,6 @@ async def get_interviewer(
     if not row:
         raise HTTPException(404, "Interviewer not found")
     return row
-
 
 # Update
 @app.put("/interviewers/{interviewer_id}", response_model=InterviewerOut)
@@ -1869,7 +2035,6 @@ async def reactivate_interviewer(
     admin.update_user_by_id(row["auth_user_id"], {"app_metadata": {"blocked": False}})
     supabase.table("interviewers").update({"is_active": True}).eq("interviewer_id", interviewer_id).execute()
     return {"message": "Interviewer reactivated"}
-
 
 @app.delete("/interviewers/{interviewer_id}")
 async def delete_interviewer(
@@ -2092,10 +2257,200 @@ async def shortlist_resumes(
         "errors": errors,
     }
 
+from postgrest.exceptions import APIError as PgAPIError
+
+@app.post("/interviews/schedule")
+async def schedule_interview(
+    body: ScheduleInterviewIn,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    # Verify recruiter owns the job
+    _ = _get_job_owned(body.job_id, current_user)
+
+    # ---------- candidate (resume) ----------
+    res_row = _first_row(
+        supabase.table("resumes")
+        .select("email, full_name")
+        .eq("resume_id", body.resume_id)
+        .eq("job_id", body.job_id)
+        .limit(1)
+        .execute()
+    )
+    if not res_row:
+        raise HTTPException(404, "Resume not found for job")
+    candidate_email = res_row["email"]
+
+    # ---------- interviewer ----------
+    intv = _first_row(
+        supabase.table("interviewers")
+        .select("email, name")
+        .eq("interviewer_id", body.interviewer_id)
+        .limit(1)
+        .execute()
+    )
+    if not intv:
+        raise HTTPException(404, "Interviewer not found")
+    interviewer_email = intv["email"]
+
+    # ---------- job (and optional company) ----------
+    job = _first_row(
+        supabase.table("jobs")
+        .select("role, company_id")
+        .eq("job_id", body.job_id)
+        .limit(1)
+        .execute()
+    )
+    if not job:
+        raise HTTPException(404, "Job not found")
+
+    comp = None
+    if job.get("company_id"):
+        comp = _first_row(
+            supabase.table("companies")
+            .select("company_name")
+            .eq("company_id", job["company_id"])
+            .limit(1)
+            .execute()
+        )
+
+    role = job.get("role") or "Interview"
+    company_name = (comp or {}).get("company_name") or ""
+    # ✅ this was missing before; you referenced `title` without defining it
+    title = f"{role} Interview" + (f" — {company_name}" if company_name else "")
+
+    # ---------- idempotency check ----------
+    if body.external_id:
+        existing = _first_row(
+            supabase.table("interviews")
+            .select("*")
+            .eq("external_id", body.external_id)
+            .limit(1)
+            .execute()
+        )
+        if existing and existing.get("google_event_id"):
+            return {
+                "status": existing["status"],
+                "calendarId": existing.get("google_html_link"),
+                "meetLink": existing.get("google_meet_link"),
+                "interview_id": existing["interview_id"],
+            }
+
+    # ---------- Google Calendar ----------
+    svc = _google_service_for_user(current_user.user_id)
+
+    # Best-effort free/busy check (skip on error)
+    try:
+        fb_req = {
+            "timeMin": body.start_iso,
+            "timeMax": body.end_iso,
+            "timeZone": body.timezone,
+            "items": [{"id": interviewer_email}, {"id": candidate_email}],
+        }
+        fb = svc.freebusy().query(body=fb_req).execute()
+        busy = []
+        for cal in fb.get("calendars", {}).values():
+            busy.extend(cal.get("busy", []))
+        if busy:
+            return {"status": "CONFLICT", "busy": busy}
+    except Exception:
+        pass
+
+    description = (
+        f"Interview for {role}"
+        + (f" at {company_name}" if company_name else "")
+        + ".\n\nPlease join using the Google Meet link. "
+          "If you need to reschedule, reply to this email.\n\n"
+          "Agenda: 5 min intro, 35 min technical Q&A, 10 min wrap-up.\n"
+          "Kindly accept or decline from the calendar invite."
+    )
+
+    event = {
+        "summary": title,
+        "description": description,
+        "start": {"dateTime": body.start_iso, "timeZone": body.timezone},
+        "end":   {"dateTime": body.end_iso,   "timeZone": body.timezone},
+        "attendees": [
+            {"email": candidate_email},
+            {"email": interviewer_email},
+            {"email": current_user.email},  # recruiter/admin
+        ],
+        "extendedProperties": {"shared": {"externalId": body.external_id or secrets.token_hex(8)}},
+        "conferenceData": {
+            "createRequest": {
+                "requestId": secrets.token_hex(8),
+                "conferenceSolutionKey": {"type": "hangoutsMeet"},
+            }
+        },
+    }
+
+    created = svc.events().insert(
+        calendarId="primary",
+        body=event,
+        conferenceDataVersion=1,  # required to create Meet
+        sendUpdates="all"         # email all attendees
+    ).execute()
+
+    meet = created.get("hangoutLink") or (
+        (created.get("conferenceData", {}).get("entryPoints") or [{}])[0].get("uri")
+    )
+
+    # ---------- persist interview ----------
+    row = (
+        supabase.table("interviews")
+        .insert({
+            "job_id": body.job_id,
+            "resume_id": body.resume_id,
+            "interviewer_id": body.interviewer_id,
+            "candidate_email": candidate_email,
+            "interviewer_email": interviewer_email,
+            "recruiter_email": current_user.email,
+            "status": "SCHEDULED",  # your single main status
+            "google_event_id": created["id"],
+            "google_html_link": created.get("htmlLink"),
+            "google_meet_link": meet,
+            "external_id": (body.external_id or event["extendedProperties"]["shared"]["externalId"]),
+            "start_at": body.start_iso,
+            "end_at": body.end_iso,
+            "created_by": current_user.user_id,
+        })
+        .execute()
+        .data[0]
+    )
+
+    return {
+        "interview_id": row["interview_id"],
+        "status": row["status"],
+        "calendarId": row["google_html_link"],
+        "meetLink": row["google_meet_link"],
+        "flags": {
+            # ✅ compare against the actual stored value
+            "scheduled": row["status"] == "SCHEDULED",
+            "interview_done": row["status"] == "INTERVIEW_DONE",
+            "select": row["status"] == "SELECTED",
+            "reject": row["status"] == "REJECTED",
+            "review": row["status"] == "REVIEW",
+            "hired": row["status"] == "HIRED",
+            "absent": row["status"] == "ABSENT",
+        },
+        "attendees": created.get("attendees", []),
+    }
+
+class InterviewStatusIn(BaseModel):
+    status: str  # validate against the enum in code too
+
+@app.post("/interviews/{interview_id}/status")
+async def update_interview_status(interview_id: str, body: InterviewStatusIn,
+                                  current_user: UserIdentity = Depends(get_current_user)):
+    allowed = {"INTERVIEW_SCHEDULED","INTERVIEW_DONE","SELECTED","REJECTED","REVIEW","HIRED","ABSENT","CANCELLED"}
+    if body.status not in allowed:
+        raise HTTPException(400, "Invalid status")
+    row = supabase.table("interviews").update({"status": body.status}).eq("interview_id", interview_id).execute().data
+    if not row:
+        raise HTTPException(404, "Interview not found")
+    return {"interview_id": interview_id, "status": body.status}
 # ---------------------------------------------------------------------------
 # run (local)
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
