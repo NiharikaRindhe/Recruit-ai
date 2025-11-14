@@ -1,3 +1,25 @@
+#fastapi==0.104.1
+#uvicorn[standard]==0.24.0
+
+# Supabase SDKs (keep 2.0.3; pair with storage3<0.7)
+#supabase==2.0.3
+#storage3==0.6.1
+
+#python-dotenv==1.0.0
+#requests==2.31.0
+#PyJWT==2.8.0
+
+# Pydantic v2 + EmailStr extras
+#pydantic[email]==2.5.0
+#email-validator==2.3.0
+
+# Needed for UploadFile / multipart form-data
+#python-multipart==0.0.20
+
+# PDF text extraction (imported as "fitz")
+#PyMuPDF==1.24.10
+#passlib[bcrypt]==1.7.4
+
 fastapi==0.104.1
 uvicorn[standard]==0.24.0
 
@@ -19,3 +41,9 @@ python-multipart==0.0.20
 # PDF text extraction (imported as "fitz")
 PyMuPDF==1.24.10
 passlib[bcrypt]==1.7.4
+
+# Async HTTP client used for Google token exchange
+httpx
+
+# Google APIs (Calendar, OAuth credentials)
+google-api-python-client
