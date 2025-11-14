@@ -625,20 +625,20 @@ async def google_start(current_user: UserIdentity = Depends(get_current_user)):
         raise HTTPException(500, "Google OAuth not configured")
 
     # PKCE + state
-    state    = secrets.token_urlsafe(24)
+    state = secrets.token_urlsafe(24)
     verifier = secrets.token_urlsafe(64)
 
-    # Prod-safe cookie flags
     IS_LOCAL = os.getenv("ENV", "local").lower() == "local"
-    SAMESITE = "Lax" if IS_LOCAL else "None"   # cross-site OAuth needs None
-    SECURE   = not IS_LOCAL                    # cookies must be Secure in prod
+    SAMESITE = "Lax" if IS_LOCAL else "None"
+    SECURE   = not IS_LOCAL
 
-    # Create the response FIRST, then set cookies
+    # create the response first, then set cookies
     resp = RedirectResponse(url="/auth/google/go")
     resp.set_cookie("g_state",    state,    httponly=True, samesite=SAMESITE, secure=SECURE)
     resp.set_cookie("g_verifier", verifier, httponly=True, samesite=SAMESITE, secure=SECURE)
     resp.set_cookie("sb_uid",     current_user.user_id, httponly=True, samesite=SAMESITE, secure=SECURE)
     return resp
+
 
 
 @app.get("/auth/google/go")
