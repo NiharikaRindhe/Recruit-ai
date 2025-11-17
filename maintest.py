@@ -631,6 +631,8 @@ async def signin(request: SignInRequest):
         raise HTTPException(status_code=401, detail="Invalid email or password")
 
 # Start OAuth (must be called by a logged-in user)
+from fastapi.responses import JSONResponse
+
 @app.get("/auth/google/start")
 async def google_start(current_user: UserIdentity = Depends(get_current_user)):
     if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET or not OAUTH_REDIRECT_URI:
@@ -640,53 +642,30 @@ async def google_start(current_user: UserIdentity = Depends(get_current_user)):
     state = secrets.token_urlsafe(24)
     verifier = secrets.token_urlsafe(64)
 
-    # first redirect to our own /auth/google/go, where we build the Google URL
-    resp = RedirectResponse(url="/auth/google/go")
-
-    # store state, PKCE verifier, and user id in httpOnly cookies
-    resp.set_cookie(
-        "g_state",
-        state,
-        httponly=True,
-        samesite=COOKIE_SAMESITE,
-        secure=COOKIE_SECURE,
-    )
-    resp.set_cookie(
-        "g_verifier",
-        verifier,
-        httponly=True,
-        samesite=COOKIE_SAMESITE,
-        secure=COOKIE_SECURE,
-    )
-    resp.set_cookie(
-        "sb_uid",
-        current_user.user_id,
-        httponly=True,
-        samesite=COOKIE_SAMESITE,
-        secure=COOKIE_SECURE,
-    )
-    return resp
-
-@app.get("/auth/google/go")
-def google_go(request: Request):
-    state = request.cookies.get("g_state")
-    verifier = request.cookies.get("g_verifier")
-    if not state or not verifier:
-        raise HTTPException(400, "Missing PKCE cookies")
-
+    # build Google OAuth URL directly here
     params = {
         "client_id": GOOGLE_CLIENT_ID,
         "redirect_uri": OAUTH_REDIRECT_URI,
         "response_type": "code",
         "scope": " ".join(GOOGLE_SCOPES),
         "state": state,
-        "access_type": "offline",   # get refresh token
-        "prompt": "consent",        # ensure refresh token even if previously consented
+        "access_type": "offline",
+        "prompt": "consent",
         "code_challenge": _pkce_challenge(verifier),
         "code_challenge_method": "S256",
     }
     url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
-    return RedirectResponse(url)
+
+    # respond with JSON + set cookies
+    resp = JSONResponse({"auth_url": url})
+    resp.set_cookie("g_state", state, httponly=True,
+                    samesite=COOKIE_SAMESITE, secure=COOKIE_SECURE)
+    resp.set_cookie("g_verifier", verifier, httponly=True,
+                    samesite=COOKIE_SAMESITE, secure=COOKIE_SECURE)
+    resp.set_cookie("sb_uid", current_user.user_id, httponly=True,
+                    samesite=COOKIE_SAMESITE, secure=COOKIE_SECURE)
+    return resp
+
 
 # Google's redirect URI (MUST match in Google console)
 @app.get("/oauth2/callback")
