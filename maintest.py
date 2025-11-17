@@ -1196,7 +1196,7 @@ def _ollama_generate(prompt: str) -> str:
     return generate_jd_with_ollama(prompt)
 
 # Prompts
-ALLOWED_RESUME_STATUSES = {"PENDING", "PARSED", "REJECTED","SHORTLISTED"}
+ALLOWED_RESUME_STATUSES = {"PENDING", "PARSED", "REJECTED","SHORTLISTED","INTERVIEW_SCHEDULED"}
 
 EXTRACT_PROMPT = (
     "You are a resume parsing assistant. Return ONLY JSON with these exact top-level keys: "
@@ -2409,8 +2409,8 @@ async def schedule_interview(
     created = svc.events().insert(
         calendarId="primary",
         body=event,
-        conferenceDataVersion=1,  # required to create Meet
-        sendUpdates="all"         # email all attendees
+        conferenceDataVersion=1,
+        sendUpdates="all"
     ).execute()
 
     meet = created.get("hangoutLink") or (
@@ -2427,7 +2427,7 @@ async def schedule_interview(
             "candidate_email": candidate_email,
             "interviewer_email": interviewer_email,
             "recruiter_email": current_user.email,
-            "status": "SCHEDULED",  # your single main status
+            "status": "INTERVIEW_SCHEDULED",
             "google_event_id": created["id"],
             "google_html_link": created.get("htmlLink"),
             "google_meet_link": meet,
@@ -2440,21 +2440,29 @@ async def schedule_interview(
         .data[0]
     )
 
+    # NEW: update resume status
+    try:
+        supabase.table("resumes").update(
+            {"status": "INTERVIEW_SCHEDULED"}
+        ).eq("resume_id", body.resume_id).execute()
+    except Exception as e:
+        print("Non-fatal: failed to update resume status:", e)
+
     return {
         "interview_id": row["interview_id"],
         "status": row["status"],
         "calendarId": row["google_html_link"],
         "meetLink": row["google_meet_link"],
         "flags": {
-            # ✅ compare against the actual stored value
-            "scheduled": row["status"] == "SCHEDULED",
+            "scheduled":      row["status"] == "INTERVIEW_SCHEDULED",
             "interview_done": row["status"] == "INTERVIEW_DONE",
-            "select": row["status"] == "SELECTED",
-            "reject": row["status"] == "REJECTED",
-            "review": row["status"] == "REVIEW",
-            "hired": row["status"] == "HIRED",
-            "absent": row["status"] == "ABSENT",
+            "select":         row["status"] == "SELECTED",
+            "reject":         row["status"] == "REJECTED",
+            "review":         row["status"] == "REVIEW",
+            "hired":          row["status"] == "HIRED",
+            "absent":         row["status"] == "ABSENT",
         },
+
         "attendees": created.get("attendees", []),
     }
 
