@@ -62,6 +62,18 @@ except Exception:
 # ---------------------------------------------------------------------------
 load_dotenv()
 
+ENV = os.getenv("ENV", "local").lower()
+
+if ENV in ("local", "dev", "development"):
+    # local HTTP testing
+    COOKIE_SAMESITE = "Lax"    # cookies still sent for top-level GETs
+    COOKIE_SECURE = False      # allow http://localhost
+else:
+    # Render / production (must be HTTPS)
+    COOKIE_SAMESITE = "None"   # allow cross-site redirects
+    COOKIE_SECURE = True       # required when SameSite=None
+
+
 app = FastAPI(title="Recruitment AI API", version="1.0.0")
 
 # CORS
@@ -628,17 +640,32 @@ async def google_start(current_user: UserIdentity = Depends(get_current_user)):
     state = secrets.token_urlsafe(24)
     verifier = secrets.token_urlsafe(64)
 
-    SameSite="None"
-    Secure=True
-
-    # create the response first, then set cookies
+    # first redirect to our own /auth/google/go, where we build the Google URL
     resp = RedirectResponse(url="/auth/google/go")
-    resp.set_cookie("g_state",    state,    httponly=True, samesite=SAMESITE, secure=SECURE)
-    resp.set_cookie("g_verifier", verifier, httponly=True, samesite=SAMESITE, secure=SECURE)
-    resp.set_cookie("sb_uid",     current_user.user_id, httponly=True, samesite=SAMESITE, secure=SECURE)
+
+    # store state, PKCE verifier, and user id in httpOnly cookies
+    resp.set_cookie(
+        "g_state",
+        state,
+        httponly=True,
+        samesite=COOKIE_SAMESITE,
+        secure=COOKIE_SECURE,
+    )
+    resp.set_cookie(
+        "g_verifier",
+        verifier,
+        httponly=True,
+        samesite=COOKIE_SAMESITE,
+        secure=COOKIE_SECURE,
+    )
+    resp.set_cookie(
+        "sb_uid",
+        current_user.user_id,
+        httponly=True,
+        samesite=COOKIE_SAMESITE,
+        secure=COOKIE_SECURE,
+    )
     return resp
-
-
 
 @app.get("/auth/google/go")
 def google_go(request: Request):
