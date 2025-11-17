@@ -628,9 +628,8 @@ async def google_start(current_user: UserIdentity = Depends(get_current_user)):
     state = secrets.token_urlsafe(24)
     verifier = secrets.token_urlsafe(64)
 
-    IS_LOCAL = os.getenv("ENV", "local").lower() == "local"
-    SAMESITE = "Lax" if IS_LOCAL else "None"
-    SECURE   = not IS_LOCAL
+    SameSite="None"
+    Secure=True
 
     # create the response first, then set cookies
     resp = RedirectResponse(url="/auth/google/go")
