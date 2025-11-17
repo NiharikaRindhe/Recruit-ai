@@ -70,7 +70,7 @@ allow_origins = [o.strip() for o in origins_env.split(",")] if origins_env else 
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins = ["http://localhost:3000", "https://recruit-ai-gms.netlify.app","https://recruit-ai-e055.onrender.com","http://localhost:5173"]
+    allow_origins = ["http://localhost:3000", "https://recruit-ai-gms.netlify.app","https://recruit-ai-e055.onrender.com","http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
