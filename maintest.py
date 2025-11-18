@@ -57,6 +57,17 @@ except Exception:
         salt, digest = raw[:16], raw[16:]
         return hashlib.sha256(salt + p.encode("utf-8")).digest() == digest
 
+import datetime
+from fastapi import Request
+from fastapi.responses import RedirectResponse
+import fitz  # PyMuPDF
+
+# Add this block:
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except Exception:
+    ZoneInfo = None
+
 # ---------------------------------------------------------------------------
 # env
 # ---------------------------------------------------------------------------
@@ -543,6 +554,56 @@ def _get_company_id_for_user(user: UserIdentity) -> Optional[str]:
     )
     return rec[0]["company_id"] if rec else None
 
+def _today_bounds_for_tz(tz_name: str = "Asia/Kolkata") -> tuple[datetime.date, str, str]:
+    """
+    Compute today's start & end in the given timezone, but return
+    ISO strings in UTC with 'Z' suffix for Supabase .gte/.lt filters.
+
+    Returns:
+      (local_date, start_iso_utc, end_iso_utc)
+    """
+    # choose timezone (fallback to UTC if anything goes wrong)
+    if ZoneInfo is not None:
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = datetime.timezone.utc
+    else:
+        tz = datetime.timezone.utc
+
+    now = datetime.datetime.now(tz)
+    start_local = datetime.datetime(now.year, now.month, now.day, 0, 0, 0, tzinfo=tz)
+    end_local = start_local + datetime.timedelta(days=1)
+
+    start_utc = start_local.astimezone(datetime.timezone.utc)
+    end_utc = end_local.astimezone(datetime.timezone.utc)
+
+    # Format as ISO strings with Z suffix.
+    return (
+        start_local.date(),
+        start_utc.isoformat().replace("+00:00", "Z"),
+        end_utc.isoformat().replace("+00:00", "Z"),
+    )
+
+def _get_interviewer_by_auth_user(user: UserIdentity) -> Dict[str, Any]:
+    """
+    Resolve the interviewer row for the currently authenticated Supabase user.
+    Used for interviewer portal APIs (they sign in via /auth/interviewer/signin).
+    """
+    row = (
+        supabase.table("interviewers")
+        .select("interviewer_id, auth_user_id, company_id, name, email, is_active")
+        .eq("auth_user_id", user.user_id)
+        .single()
+        .execute()
+        .data
+    )
+    if not row:
+        raise HTTPException(status_code=403, detail="Interviewer profile not found")
+    if not row.get("is_active", True):
+        raise HTTPException(status_code=403, detail="Interviewer is deactivated")
+    return row
+
 def _pkce_challenge(verifier: str) -> str:
     dig = hashlib.sha256(verifier.encode()).digest()
     return base64.urlsafe_b64encode(dig).rstrip(b"=").decode()
@@ -750,6 +811,136 @@ async def get_me(current_user: UserIdentity = Depends(get_current_user)):
         "recruiter": None,
         "company": None,
         "has_company": False,
+    }
+
+@app.get("/recruiter/interviews/today")
+async def list_recruiter_interviews_today(
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    """
+    For the logged-in recruiter, list INTERVIEW_SCHEDULED interviews for *today*
+    across all jobs they created.
+
+    Returns: candidate name, job title, interviewer name, date, time, status, meet link.
+    """
+    # 1) All jobs created by this recruiter
+    jobs = (
+        supabase.table("jobs")
+        .select("job_id, role")
+        .eq("created_by", current_user.user_id)
+        .execute()
+        .data
+        or []
+    )
+    if not jobs:
+        return {
+            "date": datetime.date.today().isoformat(),
+            "count": 0,
+            "interviews": [],
+        }
+
+    job_ids = [j["job_id"] for j in jobs]
+    jobs_by_id = {j["job_id"]: j for j in jobs}
+
+    # 2) Today's window in IST, converted to UTC
+    day, start_iso, end_iso = _today_bounds_for_tz("Asia/Kolkata")
+
+    # 3) Interviews for those jobs today, scheduled
+    rows = (
+        supabase.table("interviews")
+        .select(
+            "interview_id, job_id, resume_id, interviewer_id, "
+            "status, start_at, end_at, google_meet_link, google_html_link"
+        )
+        .in_("job_id", job_ids)
+        .eq("status", "INTERVIEW_SCHEDULED")
+        .gte("start_at", start_iso)
+        .lt("start_at", end_iso)
+        .order("start_at", desc=False)
+        .execute()
+        .data
+        or []
+    )
+
+    if not rows:
+        return {
+            "date": day.isoformat(),
+            "count": 0,
+            "interviews": [],
+        }
+
+    # 4) Bulk fetch resumes (candidate) and interviewers
+    resume_ids = sorted({r["resume_id"] for r in rows if r.get("resume_id")})
+    interviewer_ids = sorted({r["interviewer_id"] for r in rows if r.get("interviewer_id")})
+
+    resumes_by_id: Dict[str, Dict[str, Any]] = {}
+    interviewers_by_id: Dict[str, Dict[str, Any]] = {}
+
+    if resume_ids:
+        res_rows = (
+            supabase.table("resumes")
+            .select("resume_id, full_name, email")
+            .in_("resume_id", resume_ids)
+            .execute()
+            .data
+            or []
+        )
+        resumes_by_id = {r["resume_id"]: r for r in res_rows}
+
+    if interviewer_ids:
+        intv_rows = (
+            supabase.table("interviewers")
+            .select("interviewer_id, name, email")
+            .in_("interviewer_id", interviewer_ids)
+            .execute()
+            .data
+            or []
+        )
+        interviewers_by_id = {i["interviewer_id"]: i for i in intv_rows}
+
+    items = []
+    for r in rows:
+        job = jobs_by_id.get(r["job_id"])
+        res = resumes_by_id.get(r["resume_id"])
+        intv = interviewers_by_id.get(r["interviewer_id"])
+
+        start_at = r.get("start_at")
+        end_at = r.get("end_at")
+
+        date_str = None
+        time_str = None
+        if isinstance(start_at, str):
+            try:
+                date_part, time_part = start_at.split("T", 1)
+                date_str = date_part
+                time_str = time_part[:5]
+            except ValueError:
+                date_str = start_at
+
+        items.append(
+            {
+                "interview_id": r["interview_id"],
+                "candidate_name": (res or {}).get("full_name"),
+                "candidate_email": (res or {}).get("email"),
+                "job_id": r.get("job_id"),
+                "job_title": (job or {}).get("role"),
+                "interviewer_id": r.get("interviewer_id"),
+                "interviewer_name": (intv or {}).get("name"),
+                "interviewer_email": (intv or {}).get("email"),
+                "date": date_str or day.isoformat(),
+                "time": time_str,
+                "status": r.get("status"),
+                "meet_link": r.get("google_meet_link"),
+                "calendar_link": r.get("google_html_link"),
+                "start_at": start_at,
+                "end_at": end_at,
+            }
+        )
+
+    return {
+        "date": day.isoformat(),
+        "count": len(items),
+        "interviews": items,
     }
 
 # ---------- company ----------
@@ -2168,6 +2359,306 @@ async def interviewer_me(current_user: UserIdentity = Depends(get_current_user))
         "user": {"id": current_user.user_id, "email": current_user.email},
         "interviewer": row,
     }
+
+@app.get("/recruiter/interviews/today")
+async def list_recruiter_interviews_today(
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    """
+    For the logged-in recruiter, list INTERVIEW_SCHEDULED interviews for *today*
+    across all jobs they created.
+
+    Returns: candidate name, job title, interviewer name, date, time, status, meet link.
+    """
+    # 1) All jobs created by this recruiter
+    jobs = (
+        supabase.table("jobs")
+        .select("job_id, role")
+        .eq("created_by", current_user.user_id)
+        .execute()
+        .data
+        or []
+    )
+    if not jobs:
+        return {
+            "date": datetime.date.today().isoformat(),
+            "count": 0,
+            "interviews": [],
+        }
+
+    job_ids = [j["job_id"] for j in jobs]
+    jobs_by_id = {j["job_id"]: j for j in jobs}
+
+    # 2) Today's window in IST, converted to UTC
+    day, start_iso, end_iso = _today_bounds_for_tz("Asia/Kolkata")
+
+    # 3) Interviews for those jobs today, scheduled
+    rows = (
+        supabase.table("interviews")
+        .select(
+            "interview_id, job_id, resume_id, interviewer_id, "
+            "status, start_at, end_at, google_meet_link, google_html_link"
+        )
+        .in_("job_id", job_ids)
+        .eq("status", "INTERVIEW_SCHEDULED")
+        .gte("start_at", start_iso)
+        .lt("start_at", end_iso)
+        .order("start_at", desc=False)
+        .execute()
+        .data
+        or []
+    )
+
+    if not rows:
+        return {
+            "date": day.isoformat(),
+            "count": 0,
+            "interviews": [],
+        }
+
+    # 4) Bulk fetch resumes (candidate) and interviewers
+    resume_ids = sorted({r["resume_id"] for r in rows if r.get("resume_id")})
+    interviewer_ids = sorted({r["interviewer_id"] for r in rows if r.get("interviewer_id")})
+
+    resumes_by_id: Dict[str, Dict[str, Any]] = {}
+    interviewers_by_id: Dict[str, Dict[str, Any]] = {}
+
+    if resume_ids:
+        res_rows = (
+            supabase.table("resumes")
+            .select("resume_id, full_name, email")
+            .in_("resume_id", resume_ids)
+            .execute()
+            .data
+            or []
+        )
+        resumes_by_id = {r["resume_id"]: r for r in res_rows}
+
+    if interviewer_ids:
+        intv_rows = (
+            supabase.table("interviewers")
+            .select("interviewer_id, name, email")
+            .in_("interviewer_id", interviewer_ids)
+            .execute()
+            .data
+            or []
+        )
+        interviewers_by_id = {i["interviewer_id"]: i for i in intv_rows}
+
+    items = []
+    for r in rows:
+        job = jobs_by_id.get(r["job_id"])
+        res = resumes_by_id.get(r["resume_id"])
+        intv = interviewers_by_id.get(r["interviewer_id"])
+
+        start_at = r.get("start_at")
+        end_at = r.get("end_at")
+
+        date_str = None
+        time_str = None
+        if isinstance(start_at, str):
+            try:
+                date_part, time_part = start_at.split("T", 1)
+                date_str = date_part
+                time_str = time_part[:5]
+            except ValueError:
+                date_str = start_at
+
+        items.append(
+            {
+                "interview_id": r["interview_id"],
+                "candidate_name": (res or {}).get("full_name"),
+                "candidate_email": (res or {}).get("email"),
+                "job_id": r.get("job_id"),
+                "job_title": (job or {}).get("role"),
+                "interviewer_id": r.get("interviewer_id"),
+                "interviewer_name": (intv or {}).get("name"),
+                "interviewer_email": (intv or {}).get("email"),
+                "date": date_str or day.isoformat(),
+                "time": time_str,
+                "status": r.get("status"),
+                "meet_link": r.get("google_meet_link"),
+                "calendar_link": r.get("google_html_link"),
+                "start_at": start_at,
+                "end_at": end_at,
+            }
+        )
+
+    return {
+        "date": day.isoformat(),
+        "count": len(items),
+        "interviews": items,
+    }
+
+@app.get("/interviewer/interviews")
+async def list_my_interviews(
+    status: Optional[str] = Query(
+        None,
+        description="Optional: filter by interview status (e.g. INTERVIEW_SCHEDULED, INTERVIEW_DONE, etc.)"
+    ),
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    """
+    List all interviews assigned to the logged-in interviewer.
+    Uses 'interviews' table and joins job + resume info in Python.
+    """
+    interviewer = _get_interviewer_by_auth_user(current_user)
+    interviewer_id = interviewer["interviewer_id"]
+
+    # Base query: all interviews for this interviewer
+    q = (
+        supabase.table("interviews")
+        .select("interview_id, job_id, resume_id, status, start_at, end_at, google_meet_link, google_html_link")
+        .eq("interviewer_id", interviewer_id)
+    )
+    if status:
+        q = q.eq("status", status)
+
+    # Sort by start time (soonest first)
+    try:
+        q = q.order("start_at", desc=False)
+    except Exception:
+        pass
+
+    interviews = q.execute().data or []
+
+    # ---- Bulk-load jobs + resumes to avoid N+1 queries ----
+    job_ids = sorted({i["job_id"] for i in interviews if i.get("job_id")})
+    resume_ids = sorted({i["resume_id"] for i in interviews if i.get("resume_id")})
+
+    jobs_by_id: Dict[str, Dict[str, Any]] = {}
+    resumes_by_id: Dict[str, Dict[str, Any]] = {}
+
+    if job_ids:
+        jobs = (
+            supabase.table("jobs")
+            .select("job_id, role, location")
+            .in_("job_id", job_ids)
+            .execute()
+            .data
+            or []
+        )
+        jobs_by_id = {j["job_id"]: j for j in jobs}
+
+    if resume_ids:
+        res_rows = (
+            supabase.table("resumes")
+            .select("resume_id, full_name, email")
+            .in_("resume_id", resume_ids)
+            .execute()
+            .data
+            or []
+        )
+        resumes_by_id = {r["resume_id"]: r for r in res_rows}
+
+    # Build response list
+    items = []
+    for row in interviews:
+        job = jobs_by_id.get(row["job_id"]) if row.get("job_id") else None
+        res = resumes_by_id.get(row["resume_id"]) if row.get("resume_id") else None
+        items.append(
+            {
+                "interview_id": row["interview_id"],
+                "job_id": row.get("job_id"),
+                "resume_id": row.get("resume_id"),
+                "status": row.get("status"),
+                "start_at": row.get("start_at"),
+                "end_at": row.get("end_at"),
+                # meet + calendar link from interviews table
+                "meet_link": row.get("google_meet_link"),
+                "calendar_link": row.get("google_html_link"),
+                # summary info for UI
+                "job_role": (job or {}).get("role"),
+                "job_location": (job or {}).get("location"),
+                "candidate_name": (res or {}).get("full_name"),
+                "candidate_email": (res or {}).get("email"),
+            }
+        )
+
+    return {
+        "interviewer": {
+            "interviewer_id": interviewer_id,
+            "name": interviewer.get("name"),
+            "email": interviewer.get("email"),
+        },
+        "count": len(items),
+        "interviews": items,
+    }
+
+@app.get("/interviewer/interviews/{interview_id}")
+async def get_interview_detail(
+    interview_id: str,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    """
+    Detailed view for a single interview assigned to this interviewer.
+    - Loads interview from interviews table
+    - Loads JD from jobs table (via job_id)
+    - Loads resume & AI summary from resumes table (via resume_id)
+    - Optionally enriches with candidates table if linked
+    """
+    interviewer = _get_interviewer_by_auth_user(current_user)
+    interviewer_id = interviewer["interviewer_id"]
+
+    # Interview must belong to this interviewer
+    interview = _first_row(
+        supabase.table("interviews")
+        .select("*")
+        .eq("interview_id", interview_id)
+        .eq("interviewer_id", interviewer_id)
+        .limit(1)
+        .execute()
+    )
+    if not interview:
+        raise HTTPException(status_code=404, detail="Interview not found")
+
+    # JD from jobs
+    job = _first_row(
+        supabase.table("jobs")
+        .select("job_id, role, location, employment_type, work_mode, jd_text")
+        .eq("job_id", interview["job_id"])
+        .limit(1)
+        .execute()
+    )
+
+    # Resume from resumes
+    resume_row = _first_row(
+        supabase.table("resumes")
+        .select(
+            "resume_id, candidate_id, full_name, email, phone, location, "
+            "raw_text, ai_summary, skills, experience, education, projects, "
+            "certifications, jd_match_score, skill_match_score, experience_match_score"
+        )
+        .eq("resume_id", interview["resume_id"])
+        .limit(1)
+        .execute()
+    )
+
+    # Optional candidate profile (if candidate_id present)
+    candidate = None
+    if resume_row and resume_row.get("candidate_id"):
+        candidate = _first_row(
+            supabase.table("candidates")
+            .select("candidate_id, first_name, last_name, full_name, email, phone, location, links")
+            .eq("candidate_id", resume_row["candidate_id"])
+            .limit(1)
+            .execute()
+        )
+
+    return {
+        "interview": {
+            "interview_id": interview["interview_id"],
+            "status": interview.get("status"),
+            "start_at": interview.get("start_at"),
+            "end_at": interview.get("end_at"),
+            "meet_link": interview.get("google_meet_link"),
+            "calendar_link": interview.get("google_html_link"),
+        },
+        "job": job,              # includes jd_text
+        "resume": resume_row,    # includes raw_text + ai_summary + structured fields
+        "candidate": candidate,  # optional
+    }
+
 
 @app.post("/jobs/{job_id}/resumes/shortlist")
 async def shortlist_resumes(
