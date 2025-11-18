@@ -781,7 +781,7 @@ def _first_row(resp):
     data = getattr(resp, "data", None)
     if isinstance(data, list):
         return data[0] if data else None
-    return data  # may already be a dict or None
+    return data
 
 # ---------------------------------------------------------------------------
 # routes (YOUR ORIGINAL ROUTES — UNCHANGED)
@@ -1905,16 +1905,21 @@ def _insert_or_update_resume(job: dict, pdf_text: str, email_hint: Optional[str]
     ).execute()
 
 def _ensure_company(user: UserIdentity) -> Dict[str, Any]:
-    rec = (
+    """
+    Ensures that the current authenticated user has a recruiter/company row.
+    Returns the recruiter row (at least containing company_id), or 400 otherwise.
+    """
+    rec = _first_row(
         supabase.table("recruiters")
         .select("company_id")
         .eq("user_id", user.user_id)
-        .single()
+        .limit(1)
         .execute()
-        .data
     )
+
     if not rec:
         raise HTTPException(400, "Please create company profile first")
+
     return rec
 
 @app.get("/jobs/{job_id}/ranked")
@@ -2239,84 +2244,81 @@ async def list_interviewers(
 # Read one
 @app.get("/interviewers/{interviewer_id}", response_model=InterviewerOut)
 async def get_interviewer(
-    interviewer_id: str,
+    interviewer_id: UUID,
     current_user: UserIdentity = Depends(get_current_user),
 ):
-    company_id = _get_company_id_for_user(current_user)
-    row = (
+    rec = _ensure_company(current_user)
+    company_id = rec["company_id"]
+
+    row = _first_row(
         supabase.table("interviewers")
         .select("interviewer_id, name, email, company_id, is_active")
-        .eq("interviewer_id", interviewer_id)
+        .eq("interviewer_id", str(interviewer_id))
         .eq("company_id", company_id)
-        .single()
+        .limit(1)
         .execute()
-        .data
     )
+
     if not row:
         raise HTTPException(404, "Interviewer not found")
+
     return row
 
 # Update
-@app.put("/interviewers/{interviewer_id}", response_model=InterviewerOut)
+@app.patch("/interviewers/{interviewer_id}", response_model=InterviewerOut)
 async def update_interviewer(
-    interviewer_id: str,
+    interviewer_id: UUID,
     body: InterviewerUpdate,
     current_user: UserIdentity = Depends(get_current_user),
 ):
     rec = _ensure_company(current_user)
     company_id = rec["company_id"]
 
-    # 1) Fetch current row to get auth_user_id
-    existing = (
+    existing = _first_row(
         supabase.table("interviewers")
         .select("interviewer_id, auth_user_id, name, email, company_id, is_active")
-        .eq("interviewer_id", interviewer_id)
+        .eq("interviewer_id", str(interviewer_id))
         .eq("company_id", company_id)
-        .single()
+        .limit(1)
         .execute()
-        .data
     )
+
     if not existing:
         raise HTTPException(404, "Interviewer not found")
 
-    updates: Dict[str, Any] = {}
-    if body.name is not None:
-        updates["name"] = body.name.strip()
-    if body.email is not None:
-        updates["email"] = body.email.lower()
-    if body.is_active is not None:
-        updates["is_active"] = bool(body.is_active)
+    update_data = body.dict(exclude_unset=True)
 
-    if not updates:
-        return existing  # nothing to do
+    if "email" in update_data and update_data["email"]:
+        update_data["email"] = update_data["email"].lower()
 
-    # 2) Update Auth user (only if name/email changed)
-    admin = admin_sb.auth.admin
-    auth_updates: Dict[str, Any] = {}
-    if "name" in updates:
-        auth_updates.setdefault("user_metadata", {})["name"] = updates["name"]
-    if "email" in updates:
-        auth_updates["email"] = updates["email"]
+    # Sync email to auth user if there is a linked auth_user_id
+    if existing.get("auth_user_id") and "email" in update_data:
+        try:
+            admin_sb.auth.admin.update_user_by_id(
+                existing["auth_user_id"],
+                {"email": update_data["email"]},
+            )
+        except Exception as e:
+            raise HTTPException(
+                500, f"Failed to update auth user email: {e}"
+            )
 
-    if auth_updates:
-        admin.update_user_by_id(existing["auth_user_id"], auth_updates)
+    if not update_data:
+        # Nothing to update; just return the existing record
+        return existing
 
-    # 3) Update your row
-    row = (
+    updated_rows = (
         supabase.table("interviewers")
-        .update(updates)
-        .eq("interviewer_id", interviewer_id)
+        .update(update_data)
+        .eq("interviewer_id", str(interviewer_id))
         .eq("company_id", company_id)
         .execute()
-        .data[0]
+        .data
     )
-    return {
-        "interviewer_id": row["interviewer_id"],
-        "name": row["name"],
-        "email": row["email"],
-        "company_id": row.get("company_id"),
-        "is_active": row.get("is_active", True),
-    }
+
+    # Supabase update returns a list
+    return updated_rows[0] if updated_rows else existing
+
 
 @app.post("/interviewers/{interviewer_id}/deactivate")
 async def deactivate_interviewer(
