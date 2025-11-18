@@ -642,24 +642,23 @@ def _today_bounds_for_tz(tz_name: str = "Asia/Kolkata") -> tuple[datetime.date, 
         end_utc.isoformat().replace("+00:00", "Z"),
     )
 
+from postgrest.exceptions import APIError as PgAPIError  # you already import this later
+
 def _get_interviewer_by_auth_user(user: UserIdentity) -> Dict[str, Any]:
-    """
-    Resolve the interviewer row for the currently authenticated Supabase user.
-    Used for interviewer portal APIs (they sign in via /auth/interviewer/signin).
-    """
-    row = (
+    resp = (
         supabase.table("interviewers")
         .select("interviewer_id, auth_user_id, company_id, name, email, is_active")
         .eq("auth_user_id", user.user_id)
-        .single()
+        .limit(1)
         .execute()
-        .data
     )
+    row = _first_row(resp)
     if not row:
         raise HTTPException(status_code=403, detail="Interviewer profile not found")
     if not row.get("is_active", True):
         raise HTTPException(status_code=403, detail="Interviewer is deactivated")
     return row
+
 
 def _get_interview_context(
     interview_id: str,
@@ -2483,14 +2482,14 @@ async def interviewer_signin(body: InterviewerSignIn):
 
 @app.get("/interviewer/me")
 async def interviewer_me(current_user: UserIdentity = Depends(get_current_user)):
-    row = (
+    resp = (
         supabase.table("interviewers")
         .select("interviewer_id, name, email, company_id, is_active")
         .eq("auth_user_id", current_user.user_id)
-        .single()
+        .limit(1)
         .execute()
-        .data
     )
+    row = _first_row(resp)
     if not row:
         raise HTTPException(status_code=404, detail="Interviewer profile not found")
     if not row.get("is_active", True):
@@ -2499,6 +2498,7 @@ async def interviewer_me(current_user: UserIdentity = Depends(get_current_user))
         "user": {"id": current_user.user_id, "email": current_user.email},
         "interviewer": row,
     }
+
 @app.get("/interviewer/interviews/today")
 async def list_my_interviews_today(
     current_user: UserIdentity = Depends(get_current_user),
