@@ -22,6 +22,7 @@ from supabase.client import ClientOptions
 import datetime
 from fastapi import Request
 from fastapi.responses import RedirectResponse
+from uuid import UUID
 import fitz  # PyMuPDF
 # Safe import for different storage3 versions
 try:
@@ -244,6 +245,37 @@ class ScheduleInterviewIn(BaseModel):
     timezone: str = "Asia/Kolkata"
     external_id: Optional[str] = None  # for idempotency
 
+from typing import Literal
+
+class CopilotQuestionIn(BaseModel):
+    transcript_so_far: Optional[str] = None
+    focus: Optional[str] = Field(
+        default=None,
+        description="Optional focus area like 'backend', 'system design', 'communication'"
+    )
+
+class CopilotAnswerIn(BaseModel):
+    question: str
+    raw_answer: str
+    dimension: Optional[str] = Field(
+        default=None,
+        description="Optional rubric dimension, e.g. 'problem_solving', 'communication'"
+    )
+
+class CopilotFinalIn(BaseModel):
+    notes: Optional[str] = Field(
+        default=None,
+        description="Free-form interviewer notes or transcript snippets"
+    )
+    decision: Optional[str] = Field(
+        default=None,
+        description="Interviewer decision: e.g. 'strong hire', 'hire', 'no hire', 'unsure'"
+    )
+    ratings: Optional[Dict[str, int]] = Field(
+        default=None,
+        description="Optional numeric ratings per competency, e.g. {'problem_solving': 4, 'communication': 3}"
+    )
+
 # ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------
@@ -268,6 +300,31 @@ async def get_current_user(
 
     return UserIdentity(user_id=user_id, email=email)
 
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+# Use your public anon key here (same one you use on the frontend)
+SUPABASE_ANON_KEY = os.environ["SUPABASE_ANON_KEY"]
+RESET_REDIRECT = os.getenv("RESET_REDIRECT", "https://recruit-ai-gms.netlify.app/reset")
+
+def _send_supabase_password_reset(email: str) -> None:
+    recover_url = SUPABASE_URL.rstrip("/") + "/auth/v1/recover"
+
+    resp = requests.post(
+        recover_url,
+        json={"email": email, "redirect_to": RESET_REDIRECT},
+        headers={
+            "apikey": SUPABASE_ANON_KEY,
+            "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+            "Content-Type": "application/json",
+        },
+        timeout=10,
+    )
+
+    if resp.status_code >= 400:
+        # You can log resp.text for more detail
+        raise HTTPException(
+            status_code=500,
+            detail=f"Supabase password reset failed with {resp.status_code}",
+        )
 # ---------------------------------------------------------------------------
 # Ollama helpers
 # ---------------------------------------------------------------------------
@@ -603,6 +660,74 @@ def _get_interviewer_by_auth_user(user: UserIdentity) -> Dict[str, Any]:
     if not row.get("is_active", True):
         raise HTTPException(status_code=403, detail="Interviewer is deactivated")
     return row
+
+def _get_interview_context(
+    interview_id: str,
+    current_user: UserIdentity,
+) -> Dict[str, Any]:
+    """
+    Load interview + job + resume for this interviewer.
+    Ensures the interview belongs to the logged-in interviewer.
+    """
+    interviewer = _get_interviewer_by_auth_user(current_user)
+    interviewer_id = interviewer["interviewer_id"]
+
+    # Interview must belong to this interviewer
+    interview = _first_row(
+        supabase.table("interviews")
+        .select(
+            "interview_id, job_id, resume_id, status, start_at, end_at, "
+            "google_meet_link, google_html_link"
+        )
+        .eq("interview_id", interview_id)
+        .eq("interviewer_id", interviewer_id)
+        .limit(1)
+        .execute()
+    )
+    if not interview:
+        raise HTTPException(status_code=404, detail="Interview not found for this interviewer")
+
+    job = _first_row(
+        supabase.table("jobs")
+        .select(
+            "job_id, role, location, employment_type, work_mode, jd_text, "
+            "skills_must_have, skills_nice_to_have, min_years, max_years"
+        )
+        .eq("job_id", interview["job_id"])
+        .limit(1)
+        .execute()
+    )
+
+    resume_row = _first_row(
+        supabase.table("resumes")
+        .select(
+            "resume_id, candidate_id, full_name, email, phone, location, "
+            "raw_text, ai_summary, skills, experience, education, projects, "
+            "certifications, jd_match_score, skill_match_score, "
+            "experience_match_score, meta"
+        )
+        .eq("resume_id", interview["resume_id"])
+        .limit(1)
+        .execute()
+    )
+
+    if not job or not resume_row:
+        raise HTTPException(status_code=404, detail="Job or resume missing for interview")
+
+    # Convert skill lists safely if stored as JSON strings
+    must = _safe_json_list(job.get("skills_must_have"))
+    nice = _safe_json_list(job.get("skills_nice_to_have"))
+
+    meta = (resume_row.get("meta") or {})
+    return {
+        "interviewer": interviewer,
+        "interview": interview,
+        "job": job,
+        "resume": resume_row,
+        "must": must,
+        "nice": nice,
+        "meta": meta,
+    }
 
 def _pkce_challenge(verifier: str) -> str:
     dig = hashlib.sha256(verifier.encode()).digest()
@@ -1522,6 +1647,22 @@ def parse_resume_structured(resume_text: str) -> dict:
     data["skills"] = _normalize_skills_block(data.get("skills") or {})
     return data
 
+def _ollama_json(prompt: str) -> dict:
+    """
+    Call Ollama and best-effort parse JSON out of the response,
+    using the same fragment/tidy helpers as the resume parser.
+    """
+    raw = _ollama_generate(prompt)
+    frag = _json_fragment(raw)
+    try:
+        return json.loads(frag)
+    except Exception:
+        try:
+            return json.loads(_tidy_json(frag))
+        except Exception:
+            # Fallback: surface raw text so the UI can still show something
+            return {"raw_text": raw}
+
 # ====== end LLM helpers block ======
 
 def _safe_json_list(x) -> List[str]:
@@ -2261,14 +2402,17 @@ async def delete_interviewer(
     return {"message": "Interviewer deactivated", "hard": False}
 
 @app.post("/interviewers/{interviewer_id}/send-reset", response_model=SendResetOut)
-async def send_reset_link(interviewer_id: str, current_user: UserIdentity = Depends(get_current_user)):
+async def send_reset_link(
+    interviewer_id: UUID,
+    current_user: UserIdentity = Depends(get_current_user),
+):
     rec = _ensure_company(current_user)
     company_id = rec["company_id"]
 
     row = (
         supabase.table("interviewers")
         .select("email")
-        .eq("interviewer_id", interviewer_id)
+        .eq("interviewer_id", str(interviewer_id))
         .eq("company_id", company_id)
         .single()
         .execute()
@@ -2278,12 +2422,8 @@ async def send_reset_link(interviewer_id: str, current_user: UserIdentity = Depe
         raise HTTPException(404, "Interviewer not found")
 
     email = row["email"].lower()
-    try:
-        public_sb.auth.reset_password_for_email(email, options={"redirect_to": RESET_REDIRECT})
-    except AttributeError:
-        public_sb.auth.reset_password_for_email(email, {"redirect_to": RESET_REDIRECT})
+    _send_supabase_password_reset(email)
 
-    # <-- return must be outside the try/except
     return {"action_link": f"(email sent) redirect_to={RESET_REDIRECT}"}
 
 @app.post("/auth/interviewer/signin", response_model=InterviewerSessionOut)
@@ -2359,47 +2499,42 @@ async def interviewer_me(current_user: UserIdentity = Depends(get_current_user))
         "user": {"id": current_user.user_id, "email": current_user.email},
         "interviewer": row,
     }
-
-@app.get("/recruiter/interviews/today")
-async def list_recruiter_interviews_today(
+@app.get("/interviewer/interviews/today")
+async def list_my_interviews_today(
     current_user: UserIdentity = Depends(get_current_user),
 ):
     """
-    For the logged-in recruiter, list INTERVIEW_SCHEDULED interviews for *today*
-    across all jobs they created.
-
-    Returns: candidate name, job title, interviewer name, date, time, status, meet link.
+    For the logged-in interviewer, list all INTERVIEW_SCHEDULED interviews for *today*
+    (using Asia/Kolkata as the logical day).
+    Returns: candidate name, job title, date, time, status, Google Meet link, etc.
     """
-    # 1) All jobs created by this recruiter
-    jobs = (
-        supabase.table("jobs")
-        .select("job_id, role")
-        .eq("created_by", current_user.user_id)
+    # 1) Find interviewer row from auth_user_id
+    interviewer = (
+        supabase.table("interviewers")
+        .select("interviewer_id, name, email, company_id, is_active")
+        .eq("auth_user_id", current_user.user_id)
+        .single()
         .execute()
         .data
-        or []
     )
-    if not jobs:
-        return {
-            "date": datetime.date.today().isoformat(),
-            "count": 0,
-            "interviews": [],
-        }
+    if not interviewer:
+        raise HTTPException(status_code=404, detail="Interviewer profile not found")
+    if not interviewer.get("is_active", True):
+        raise HTTPException(status_code=403, detail="Interviewer is deactivated")
 
-    job_ids = [j["job_id"] for j in jobs]
-    jobs_by_id = {j["job_id"]: j for j in jobs}
+    interviewer_id = interviewer["interviewer_id"]
 
-    # 2) Today's window in IST, converted to UTC
+    # 2) Today's window in IST, converted to UTC for DB filtering
     day, start_iso, end_iso = _today_bounds_for_tz("Asia/Kolkata")
 
-    # 3) Interviews for those jobs today, scheduled
+    # 3) Fetch today's scheduled interviews for this interviewer
     rows = (
         supabase.table("interviews")
         .select(
-            "interview_id, job_id, resume_id, interviewer_id, "
-            "status, start_at, end_at, google_meet_link, google_html_link"
+            "interview_id, job_id, resume_id, status, "
+            "start_at, end_at, google_meet_link, google_html_link"
         )
-        .in_("job_id", job_ids)
+        .eq("interviewer_id", interviewer_id)
         .eq("status", "INTERVIEW_SCHEDULED")
         .gte("start_at", start_iso)
         .lt("start_at", end_iso)
@@ -2409,19 +2544,23 @@ async def list_recruiter_interviews_today(
         or []
     )
 
-    if not rows:
-        return {
-            "date": day.isoformat(),
-            "count": 0,
-            "interviews": [],
-        }
-
-    # 4) Bulk fetch resumes (candidate) and interviewers
+    # 4) Bulk fetch jobs + resumes for names/titles
+    job_ids = sorted({r["job_id"] for r in rows if r.get("job_id")})
     resume_ids = sorted({r["resume_id"] for r in rows if r.get("resume_id")})
-    interviewer_ids = sorted({r["interviewer_id"] for r in rows if r.get("interviewer_id")})
 
+    jobs_by_id: Dict[str, Dict[str, Any]] = {}
     resumes_by_id: Dict[str, Dict[str, Any]] = {}
-    interviewers_by_id: Dict[str, Dict[str, Any]] = {}
+
+    if job_ids:
+        jobs = (
+            supabase.table("jobs")
+            .select("job_id, role")
+            .in_("job_id", job_ids)
+            .execute()
+            .data
+            or []
+        )
+        jobs_by_id = {j["job_id"]: j for j in jobs}
 
     if resume_ids:
         res_rows = (
@@ -2434,22 +2573,10 @@ async def list_recruiter_interviews_today(
         )
         resumes_by_id = {r["resume_id"]: r for r in res_rows}
 
-    if interviewer_ids:
-        intv_rows = (
-            supabase.table("interviewers")
-            .select("interviewer_id, name, email")
-            .in_("interviewer_id", interviewer_ids)
-            .execute()
-            .data
-            or []
-        )
-        interviewers_by_id = {i["interviewer_id"]: i for i in intv_rows}
-
     items = []
     for r in rows:
-        job = jobs_by_id.get(r["job_id"])
-        res = resumes_by_id.get(r["resume_id"])
-        intv = interviewers_by_id.get(r["interviewer_id"])
+        job = jobs_by_id.get(r["job_id"]) if r.get("job_id") else None
+        res = resumes_by_id.get(r["resume_id"]) if r.get("resume_id") else None
 
         start_at = r.get("start_at")
         end_at = r.get("end_at")
@@ -2457,10 +2584,11 @@ async def list_recruiter_interviews_today(
         date_str = None
         time_str = None
         if isinstance(start_at, str):
+            # naive string split: 2025-11-18T10:30:00+05:30
             try:
                 date_part, time_part = start_at.split("T", 1)
                 date_str = date_part
-                time_str = time_part[:5]
+                time_str = time_part[:5]  # HH:MM
             except ValueError:
                 date_str = start_at
 
@@ -2469,11 +2597,7 @@ async def list_recruiter_interviews_today(
                 "interview_id": r["interview_id"],
                 "candidate_name": (res or {}).get("full_name"),
                 "candidate_email": (res or {}).get("email"),
-                "job_id": r.get("job_id"),
                 "job_title": (job or {}).get("role"),
-                "interviewer_id": r.get("interviewer_id"),
-                "interviewer_name": (intv or {}).get("name"),
-                "interviewer_email": (intv or {}).get("email"),
                 "date": date_str or day.isoformat(),
                 "time": time_str,
                 "status": r.get("status"),
@@ -2487,6 +2611,11 @@ async def list_recruiter_interviews_today(
     return {
         "date": day.isoformat(),
         "count": len(items),
+        "interviewer": {
+            "interviewer_id": interviewer_id,
+            "name": interviewer.get("name"),
+            "email": interviewer.get("email"),
+        },
         "interviews": items,
     }
 
@@ -2659,6 +2788,304 @@ async def get_interview_detail(
         "candidate": candidate,  # optional
     }
 
+# ===================== INTERVIEW COPILOT =====================
+
+@app.get("/copilot/interviews/{interview_id}/bootstrap")
+async def copilot_bootstrap(
+    interview_id: str,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    """
+    Prepare full context for a live interview:
+    - Candidate summary
+    - JD summary
+    - Suggested interview flow
+    - Rubric
+    - Starter questions
+    """
+    ctx = _get_interview_context(interview_id, current_user)
+    job = ctx["job"]
+    resume = ctx["resume"]
+    meta = ctx["meta"]
+    must = ctx["must"]
+    nice = ctx["nice"]
+
+    job_role = job.get("role") or "Interview"
+    jd_text = job.get("jd_text") or ""
+    candidate_name = (
+        resume.get("full_name")
+        or resume.get("candidate_name")
+        or resume.get("email")
+    )
+    candidate_email = resume.get("email")
+
+    prompt = f"""
+You are an AI interview copilot assisting a human interviewer.
+
+Use the following context to prepare for the interview.
+
+JOB:
+- Title: {job_role}
+- Location: {job.get('location')}
+- Employment type: {job.get('employment_type')}
+- Work mode: {job.get('work_mode')}
+- Must-have skills: {', '.join(must or [])}
+- Nice-to-have skills: {', '.join(nice or [])}
+
+JOB DESCRIPTION:
+{jd_text[:4000]}
+
+CANDIDATE (from resume):
+- Name: {candidate_name}
+- Email: {candidate_email}
+- Location: {resume.get('location')}
+- Existing AI summary (if any): {(resume.get('ai_summary') or '')[:1500]}
+
+STRUCTURED RESUME FIELDS (truncated JSON):
+skills: {(json.dumps(resume.get('skills') or {}, ensure_ascii=False))[:1500]}
+experience: {(json.dumps((resume.get('experience') or [])[:5], ensure_ascii=False))[:2000]}
+education: {(json.dumps((resume.get('education') or [])[:3], ensure_ascii=False))[:800]}
+
+MATCH METRICS:
+- jd_match_score: {resume.get('jd_match_score')}
+- skill_match_score: {resume.get('skill_match_score')}
+- experience_match_score: {resume.get('experience_match_score')}
+- total_experience_years (if known): {meta.get('total_experience_years')}
+
+Return ONLY JSON with these exact top-level keys:
+- candidate_summary: string (Markdown, 3–5 bullet points with the strongest signals)
+- jd_summary: string (Markdown, 3–5 bullet points explaining what this role really needs)
+- suggested_flow: array of objects with keys:
+    - section: string (e.g. "Intro", "Deep dive in backend APIs")
+    - goal: string (what the interviewer should achieve in this section)
+    - minutes: integer (approx. time in minutes)
+- rubric: object mapping competency name to an object:
+    - what_good_looks_like: string
+    - scale: string describing 1–5 expectations
+- starter_questions: array of ~8 concrete, actionable interview questions tailored
+  to this role and candidate.
+
+Do not include any other keys.
+Do not include comments or extra text outside the JSON.
+    """.strip()
+
+    data = _ollama_json(prompt)
+
+    return {
+        "interview_id": interview_id,
+        "job": {
+            "role": job_role,
+            "location": job.get("location"),
+            "employment_type": job.get("employment_type"),
+            "work_mode": job.get("work_mode"),
+            "must_have": must,
+            "nice_to_have": nice,
+        },
+        "candidate": {
+            "name": candidate_name,
+            "email": candidate_email,
+            "location": resume.get("location"),
+        },
+        "copilot": data,
+    }
+
+
+@app.post("/copilot/interviews/{interview_id}/suggest-question")
+async def copilot_suggest_question(
+    interview_id: str,
+    body: CopilotQuestionIn,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    """
+    Suggest the next question to ask, given:
+    - JD + resume context
+    - Optional transcript so far
+    - Optional focus area
+    """
+    ctx = _get_interview_context(interview_id, current_user)
+    job = ctx["job"]
+    resume = ctx["resume"]
+    must = ctx["must"]
+    nice = ctx["nice"]
+
+    job_role = job.get("role") or "Interview"
+    jd_text = job.get("jd_text") or ""
+    candidate_name = (
+        resume.get("full_name")
+        or resume.get("candidate_name")
+        or resume.get("email")
+    )
+
+    transcript = (body.transcript_so_far or "").strip()
+    focus = (body.focus or "").strip()
+
+    prompt = f"""
+You are an AI interview copilot helping a human interviewer decide the NEXT question.
+
+CONTEXT:
+- Role: {job_role}
+- Must-have skills: {', '.join(must or [])}
+- Nice-to-have skills: {', '.join(nice or [])}
+
+JOB DESCRIPTION (truncated):
+{jd_text[:2000]}
+
+CANDIDATE:
+- Name: {candidate_name}
+- Email: {resume.get('email')}
+- Location: {resume.get('location')}
+
+STRUCTURED RESUME (truncated JSON):
+skills: {(json.dumps(resume.get('skills') or {}, ensure_ascii=False))[:1200]}
+experience: {(json.dumps((resume.get('experience') or [])[:5], ensure_ascii=False))[:1800]}
+
+TRANSCRIPT SO FAR:
+{transcript if transcript else "(no transcript provided)"}
+
+FOCUS AREA (if any):
+{focus if focus else "(none specified)"}
+
+Return ONLY JSON with these exact top-level keys:
+- question: string, the next question to ask (clear, concise, and specific)
+- type: string, one of ["behavioral", "technical", "system_design", "communication", "culture"]
+- rationale: short string explaining why this is a good next question
+- follow_ups: array of 2–4 short follow-up questions the interviewer can use
+
+No extra keys and no extra text outside the JSON.
+    """.strip()
+
+    data = _ollama_json(prompt)
+    return {
+        "interview_id": interview_id,
+        "suggestion": data,
+    }
+
+
+@app.post("/copilot/interviews/{interview_id}/summarize-answer")
+async def copilot_summarize_answer(
+    interview_id: str,
+    body: CopilotAnswerIn,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    """
+    Summarize a single answer into:
+    - Bullet notes
+    - Score hints per dimension
+    - Risk flags & suggested follow-ups
+    """
+    ctx = _get_interview_context(interview_id, current_user)
+    job = ctx["job"]
+    resume = ctx["resume"]
+
+    job_role = job.get("role") or "Interview"
+    dim = (body.dimension or "").strip()
+
+    prompt = f"""
+You are an AI note-taking assistant for a technical interview.
+
+JOB ROLE: {job_role}
+
+CANDIDATE:
+- Name: {resume.get('full_name') or resume.get('email')}
+- Email: {resume.get('email')}
+
+QUESTION ASKED:
+{body.question}
+
+CANDIDATE ANSWER (verbatim):
+{body.raw_answer}
+
+DIMENSION (if provided) indicates which competency this question targets, e.g.
+"problem_solving", "system_design", "communication", "culture", "leadership".
+Dimension provided: {dim if dim else "(none specified, infer from the content if possible)"}
+
+Return ONLY JSON with these exact top-level keys:
+- notes_markdown: string (3–8 bullet points in Markdown capturing key facts, signals, and examples)
+- scores: object mapping dimension name (e.g. "problem_solving") to an integer 1–5
+- risk_flags: array of short strings describing any concerns or red flags; empty array if none
+- follow_up_suggestions: array of 2–4 follow-up questions the interviewer could ask next
+
+No extra keys, no comments, and no text outside the JSON.
+    """.strip()
+
+    data = _ollama_json(prompt)
+    return {
+        "interview_id": interview_id,
+        "analysis": data,
+    }
+
+
+@app.post("/copilot/interviews/{interview_id}/final-report")
+async def copilot_final_report(
+    interview_id: str,
+    body: CopilotFinalIn,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    """
+    Generate a concise final report after the interview:
+    - Overall summary
+    - Strengths / weaknesses
+    - Risk flags
+    - Recommended decision
+    """
+    ctx = _get_interview_context(interview_id, current_user)
+    job = ctx["job"]
+    resume = ctx["resume"]
+
+    job_role = job.get("role") or "Interview"
+    notes = (body.notes or "").strip()
+    decision = (body.decision or "").strip()
+    ratings = body.ratings or {}
+
+    prompt = f"""
+You are an AI assistant helping an interviewer write a final evaluation.
+
+JOB:
+- Role: {job_role}
+- Location: {job.get('location')}
+- Employment type: {job.get('employment_type')}
+- Work mode: {job.get('work_mode')}
+
+CANDIDATE:
+- Name: {resume.get('full_name') or resume.get('email')}
+- Email: {resume.get('email')}
+- Location: {resume.get('location')}
+
+MATCH METRICS:
+- jd_match_score: {resume.get('jd_match_score')}
+- skill_match_score: {resume.get('skill_match_score')}
+- experience_match_score: {resume.get('experience_match_score')}
+
+EXISTING AI RESUME SUMMARY (if any):
+{(resume.get('ai_summary') or '')[:1500]}
+
+INTERVIEWER NOTES (raw text, may be messy):
+{notes if notes else "(no extra notes provided)"}
+
+INTERVIEWER DECISION (if provided):
+{decision if decision else "(no explicit decision yet)"}
+
+INTERVIEWER RATINGS (JSON, if provided):
+{json.dumps(ratings, ensure_ascii=False)}
+
+Return ONLY JSON with these exact top-level keys:
+- summary_markdown: short Markdown summary (max ~250 words) with clear sections:
+    - "Overall impression"
+    - "Strengths"
+    - "Concerns"
+- recommended_decision: one of ["strong_hire", "hire", "no_hire", "unsure"]
+- justification: 2–4 bullet points explaining the recommendation
+- coaching_for_next_round: 2–5 bullet points suggesting what next-round interviewers should focus on
+
+No extra keys and no text outside the JSON.
+    """.strip()
+
+    data = _ollama_json(prompt)
+
+    return {
+        "interview_id": interview_id,
+        "final_report": data,
+    }
 
 @app.post("/jobs/{job_id}/resumes/shortlist")
 async def shortlist_resumes(
