@@ -1,6 +1,12 @@
 import os
 import re
 import json
+# OAuth & HTTP
+import base64, secrets, hashlib
+from urllib.parse import urlencode
+import httpx
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,9 +17,12 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 import jwt
 import requests
-
-import hashlib
+# imports (near the top)
+from supabase.client import ClientOptions
 import datetime
+from fastapi import Request
+from fastapi.responses import RedirectResponse
+from uuid import UUID
 import fitz  # PyMuPDF
 # Safe import for different storage3 versions
 try:
@@ -49,10 +58,33 @@ except Exception:
         salt, digest = raw[:16], raw[16:]
         return hashlib.sha256(salt + p.encode("utf-8")).digest() == digest
 
+import datetime
+from fastapi import Request
+from fastapi.responses import RedirectResponse
+import fitz  # PyMuPDF
+
+# Add this block:
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except Exception:
+    ZoneInfo = None
+
 # ---------------------------------------------------------------------------
 # env
 # ---------------------------------------------------------------------------
 load_dotenv()
+
+ENV = os.getenv("ENV", "local").lower()
+
+if ENV in ("local", "dev", "development"):
+    # local HTTP testing
+    COOKIE_SAMESITE = "Lax"    # cookies still sent for top-level GETs
+    COOKIE_SECURE = False      # allow http://localhost
+else:
+    # Render / production (must be HTTPS)
+    COOKIE_SAMESITE = "None"   # allow cross-site redirects
+    COOKIE_SECURE = True       # required when SameSite=None
+
 
 app = FastAPI(title="Recruitment AI API", version="1.0.0")
 
@@ -62,11 +94,18 @@ allow_origins = [o.strip() for o in origins_env.split(",")] if origins_env else 
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allow_origins,
+    allow_origins = ["http://localhost:3000", "https://recruit-ai-gms.netlify.app","https://recruit-ai-e055.onrender.com","http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+OAUTH_REDIRECT_URI = os.getenv("OAUTH_REDIRECT_URI")
+FRONTEND_SUCCESS_URL = os.getenv("FRONTEND_SUCCESS_URL", "https://recruit-ai-gms.netlify.app")
+GOOGLE_SCOPES = ["https://www.googleapis.com/auth/calendar"]
+
 # ---------------------------------------------------------------------------
 # Supabase
 # ---------------------------------------------------------------------------
@@ -75,7 +114,31 @@ SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
     raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in environment")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+# BEFORE
+# supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+# AFTER
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")  # <- add this
+if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
+    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in environment")
+if not SUPABASE_ANON_KEY:
+    raise RuntimeError("Missing SUPABASE_ANON_KEY in environment")
+
+admin_sb: Client = create_client(
+    SUPABASE_URL,
+    SUPABASE_SERVICE_KEY,
+    options=ClientOptions(auto_refresh_token=False, persist_session=False),
+)
+
+public_sb: Client = create_client(
+    SUPABASE_URL,
+    SUPABASE_ANON_KEY,
+    options=ClientOptions(auto_refresh_token=False, persist_session=False),
+)
+
+# Keep all your DB/storage code working without edits:
+supabase: Client = admin_sb
+
 INVITE_REDIRECT = os.getenv("INTERVIEWER_INVITE_REDIRECT")
 RESET_REDIRECT  = os.getenv("PASSWORD_RESET_REDIRECT")
 # ---------- NEW: storage + TTL settings ----------
@@ -87,9 +150,7 @@ RESUME_TTL_HOURS = int(os.getenv("RESUME_TTL_HOURS", "36"))
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "https://ollama.com/api")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gpt-oss:20b")
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
-# ---------------------------------------------------------------------------
-# Security
-# ---------------------------------------------------------------------------
+
 security = HTTPBearer()
 # ---------------------------------------------------------------------------
 # Pydantic models
@@ -170,6 +231,51 @@ class InterviewerSessionOut(BaseModel):
     user: Dict[str, Any]
     interviewer: Dict[str, Any]
 
+class BulkShortlistRequest(BaseModel):
+    resume_ids: Optional[List[str]] = None          # shortlist by resume_id(s)
+    emails: Optional[List[EmailStr]] = None         # or by candidate email(s)
+    only_if_status: str = "PARSED"                  # safety: only update when current status == PARSED
+
+class ScheduleInterviewIn(BaseModel):
+    job_id: str
+    resume_id: str
+    interviewer_id: str
+    start_iso: str
+    end_iso: str
+    timezone: str = "Asia/Kolkata"
+    external_id: Optional[str] = None  # for idempotency
+
+from typing import Literal
+
+class CopilotQuestionIn(BaseModel):
+    transcript_so_far: Optional[str] = None
+    focus: Optional[str] = Field(
+        default=None,
+        description="Optional focus area like 'backend', 'system design', 'communication'"
+    )
+
+class CopilotAnswerIn(BaseModel):
+    question: str
+    raw_answer: str
+    dimension: Optional[str] = Field(
+        default=None,
+        description="Optional rubric dimension, e.g. 'problem_solving', 'communication'"
+    )
+
+class CopilotFinalIn(BaseModel):
+    notes: Optional[str] = Field(
+        default=None,
+        description="Free-form interviewer notes or transcript snippets"
+    )
+    decision: Optional[str] = Field(
+        default=None,
+        description="Interviewer decision: e.g. 'strong hire', 'hire', 'no hire', 'unsure'"
+    )
+    ratings: Optional[Dict[str, int]] = Field(
+        default=None,
+        description="Optional numeric ratings per competency, e.g. {'problem_solving': 4, 'communication': 3}"
+    )
+
 # ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------
@@ -194,6 +300,31 @@ async def get_current_user(
 
     return UserIdentity(user_id=user_id, email=email)
 
+SUPABASE_URL = os.environ["SUPABASE_URL"]
+# Use your public anon key here (same one you use on the frontend)
+SUPABASE_ANON_KEY = os.environ["SUPABASE_ANON_KEY"]
+RESET_REDIRECT = os.getenv("RESET_REDIRECT", "https://recruit-ai-gms.netlify.app/reset")
+
+def _send_supabase_password_reset(email: str) -> None:
+    recover_url = SUPABASE_URL.rstrip("/") + "/auth/v1/recover"
+
+    resp = requests.post(
+        recover_url,
+        json={"email": email, "redirect_to": RESET_REDIRECT},
+        headers={
+            "apikey": SUPABASE_ANON_KEY,
+            "Authorization": f"Bearer {SUPABASE_ANON_KEY}",
+            "Content-Type": "application/json",
+        },
+        timeout=10,
+    )
+
+    if resp.status_code >= 400:
+        # You can log resp.text for more detail
+        raise HTTPException(
+            status_code=500,
+            detail=f"Supabase password reset failed with {resp.status_code}",
+        )
 # ---------------------------------------------------------------------------
 # Ollama helpers
 # ---------------------------------------------------------------------------
@@ -480,6 +611,178 @@ def _get_company_id_for_user(user: UserIdentity) -> Optional[str]:
     )
     return rec[0]["company_id"] if rec else None
 
+def _today_bounds_for_tz(tz_name: str = "Asia/Kolkata") -> tuple[datetime.date, str, str]:
+    """
+    Compute today's start & end in the given timezone, but return
+    ISO strings in UTC with 'Z' suffix for Supabase .gte/.lt filters.
+
+    Returns:
+      (local_date, start_iso_utc, end_iso_utc)
+    """
+    # choose timezone (fallback to UTC if anything goes wrong)
+    if ZoneInfo is not None:
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = datetime.timezone.utc
+    else:
+        tz = datetime.timezone.utc
+
+    now = datetime.datetime.now(tz)
+    start_local = datetime.datetime(now.year, now.month, now.day, 0, 0, 0, tzinfo=tz)
+    end_local = start_local + datetime.timedelta(days=1)
+
+    start_utc = start_local.astimezone(datetime.timezone.utc)
+    end_utc = end_local.astimezone(datetime.timezone.utc)
+
+    # Format as ISO strings with Z suffix.
+    return (
+        start_local.date(),
+        start_utc.isoformat().replace("+00:00", "Z"),
+        end_utc.isoformat().replace("+00:00", "Z"),
+    )
+
+from postgrest.exceptions import APIError as PgAPIError  # you already import this later
+
+def _get_interviewer_by_auth_user(user: UserIdentity) -> Dict[str, Any]:
+    resp = (
+        supabase.table("interviewers")
+        .select("interviewer_id, auth_user_id, company_id, name, email, is_active")
+        .eq("auth_user_id", user.user_id)
+        .limit(1)
+        .execute()
+    )
+    row = _first_row(resp)
+    if not row:
+        raise HTTPException(status_code=403, detail="Interviewer profile not found")
+    if not row.get("is_active", True):
+        raise HTTPException(status_code=403, detail="Interviewer is deactivated")
+    return row
+
+
+def _get_interview_context(
+    interview_id: str,
+    current_user: UserIdentity,
+) -> Dict[str, Any]:
+    """
+    Load interview + job + resume for this interviewer.
+    Ensures the interview belongs to the logged-in interviewer.
+    """
+    interviewer = _get_interviewer_by_auth_user(current_user)
+    interviewer_id = interviewer["interviewer_id"]
+
+    # Interview must belong to this interviewer
+    interview = _first_row(
+        supabase.table("interviews")
+        .select(
+            "interview_id, job_id, resume_id, status, start_at, end_at, "
+            "google_meet_link, google_html_link"
+        )
+        .eq("interview_id", interview_id)
+        .eq("interviewer_id", interviewer_id)
+        .limit(1)
+        .execute()
+    )
+    if not interview:
+        raise HTTPException(status_code=404, detail="Interview not found for this interviewer")
+
+    job = _first_row(
+        supabase.table("jobs")
+        .select(
+            "job_id, role, location, employment_type, work_mode, jd_text, "
+            "skills_must_have, skills_nice_to_have, min_years, max_years"
+        )
+        .eq("job_id", interview["job_id"])
+        .limit(1)
+        .execute()
+    )
+
+    resume_row = _first_row(
+        supabase.table("resumes")
+        .select(
+            "resume_id, candidate_id, full_name, email, phone, location, "
+            "raw_text, ai_summary, skills, experience, education, projects, "
+            "certifications, jd_match_score, skill_match_score, "
+            "experience_match_score, meta"
+        )
+        .eq("resume_id", interview["resume_id"])
+        .limit(1)
+        .execute()
+    )
+
+    if not job or not resume_row:
+        raise HTTPException(status_code=404, detail="Job or resume missing for interview")
+
+    # Convert skill lists safely if stored as JSON strings
+    must = _safe_json_list(job.get("skills_must_have"))
+    nice = _safe_json_list(job.get("skills_nice_to_have"))
+
+    meta = (resume_row.get("meta") or {})
+    return {
+        "interviewer": interviewer,
+        "interview": interview,
+        "job": job,
+        "resume": resume_row,
+        "must": must,
+        "nice": nice,
+        "meta": meta,
+    }
+
+def _pkce_challenge(verifier: str) -> str:
+    dig = hashlib.sha256(verifier.encode()).digest()
+    return base64.urlsafe_b64encode(dig).rstrip(b"=").decode()
+
+def _save_google_tokens(user_id: str, token: dict):
+    # upsert token for this user
+    supabase.table("google_oauth_tokens").upsert({
+        "user_id": user_id,
+        "refresh_token": token.get("refresh_token"),
+        "access_token": token.get("access_token"),
+        "token_expiry": datetime.datetime.utcfromtimestamp(
+            datetime.datetime.utcnow().timestamp() + int(token.get("expires_in", 3600))
+        ).isoformat() + "Z",
+        "scope": token.get("scope"),
+        "updated_at": datetime.datetime.utcnow().isoformat() + "Z",
+    }).execute()
+
+def _get_google_refresh_token(user_id: str) -> str | None:
+    rows = (
+        supabase.table("google_oauth_tokens")
+        .select("refresh_token")
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+        .data
+    )
+    return rows[0]["refresh_token"] if rows else None
+
+
+def _google_service_for_user(user_id: str):
+    rtok = _get_google_refresh_token(user_id)
+    if not rtok:
+        raise HTTPException(400, "Google is not connected for this account")
+
+    creds = Credentials(
+        token=None,
+        refresh_token=rtok,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=GOOGLE_CLIENT_ID,
+        client_secret=GOOGLE_CLIENT_SECRET,
+        scopes=GOOGLE_SCOPES,
+    )
+    # optional proactive refresh
+    # creds.refresh(GARequest())
+    return build("calendar", "v3", credentials=creds, cache_discovery=False)
+
+def _first_row(resp):
+    """Works across supabase-py versions: returns the first row or None."""
+    if resp is None:
+        return None
+    data = getattr(resp, "data", None)
+    if isinstance(data, list):
+        return data[0] if data else None
+    return data
+
 # ---------------------------------------------------------------------------
 # routes (YOUR ORIGINAL ROUTES — UNCHANGED)
 # ---------------------------------------------------------------------------
@@ -491,7 +794,7 @@ async def root():
 @app.post("/auth/signup")
 async def signup(request: SignUpRequest):
     try:
-        resp = supabase.auth.sign_up({"email": request.email, "password": request.password})
+        resp = public_sb.auth.sign_up({"email": request.email, "password": request.password})
         if resp.user:
             return {"message": "User created successfully", "user": {"id": resp.user.id, "email": resp.user.email}}
         raise HTTPException(status_code=400, detail="Failed to create user")
@@ -501,7 +804,7 @@ async def signup(request: SignUpRequest):
 @app.post("/auth/signin")
 async def signin(request: SignInRequest):
     try:
-        resp = supabase.auth.sign_in_with_password({"email": request.email, "password": request.password})
+        resp = public_sb.auth.sign_in_with_password({"email": request.email, "password": request.password})
         if resp.session:
             return {
                 "access_token": resp.session.access_token,
@@ -511,6 +814,92 @@ async def signin(request: SignInRequest):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid email or password")
+
+# Start OAuth (must be called by a logged-in user)
+from fastapi.responses import JSONResponse
+
+@app.get("/auth/google/start")
+async def google_start(current_user: UserIdentity = Depends(get_current_user)):
+    if not GOOGLE_CLIENT_ID or not GOOGLE_CLIENT_SECRET or not OAUTH_REDIRECT_URI:
+        raise HTTPException(500, "Google OAuth not configured")
+
+    # PKCE + state
+    state = secrets.token_urlsafe(24)
+    verifier = secrets.token_urlsafe(64)
+
+    # build Google OAuth URL directly here
+    params = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "redirect_uri": OAUTH_REDIRECT_URI,
+        "response_type": "code",
+        "scope": " ".join(GOOGLE_SCOPES),
+        "state": state,
+        "access_type": "offline",
+        "prompt": "consent",
+        "code_challenge": _pkce_challenge(verifier),
+        "code_challenge_method": "S256",
+    }
+    url = "https://accounts.google.com/o/oauth2/v2/auth?" + urlencode(params)
+
+    # respond with JSON + set cookies
+    resp = JSONResponse({"auth_url": url})
+    resp.set_cookie("g_state", state, httponly=True,
+                    samesite=COOKIE_SAMESITE, secure=COOKIE_SECURE)
+    resp.set_cookie("g_verifier", verifier, httponly=True,
+                    samesite=COOKIE_SAMESITE, secure=COOKIE_SECURE)
+    resp.set_cookie("sb_uid", current_user.user_id, httponly=True,
+                    samesite=COOKIE_SAMESITE, secure=COOKIE_SECURE)
+    return resp
+
+
+# Google's redirect URI (MUST match in Google console)
+@app.get("/oauth2/callback")
+async def oauth_callback(request: Request, code: str, state: str):
+    st = request.cookies.get("g_state")
+    verifier = request.cookies.get("g_verifier")
+    user_id = request.cookies.get("sb_uid")
+    if not st or st != state or not verifier or not user_id:
+        raise HTTPException(400, "Invalid state or session")
+
+    data = {
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "code": code,
+        "code_verifier": verifier,
+        "grant_type": "authorization_code",
+        "redirect_uri": OAUTH_REDIRECT_URI,
+    }
+    async with httpx.AsyncClient() as client:
+        r = await client.post("https://oauth2.googleapis.com/token", data=data, timeout=30)
+
+    try:
+        token = r.json()
+    except Exception:
+        raise HTTPException(400, f"Token HTTP {r.status_code}: {r.text}")
+
+    if "error" in token:
+        # surfaces 'invalid_client', 'redirect_uri_mismatch', etc.
+        raise HTTPException(400, f"Google token error: {token.get('error')} - {token.get('error_description')}")
+
+    saved_rt = _get_google_refresh_token(user_id)
+    if "refresh_token" not in token:
+        if saved_rt:
+            token["refresh_token"] = saved_rt
+        else:
+            raise HTTPException(400, "Missing refresh_token (ask user to check 'consent' and offline access)")
+
+    _save_google_tokens(user_id, token)
+
+    # clean cookies and send back to frontend
+    resp = RedirectResponse(url=FRONTEND_SUCCESS_URL)
+    resp.delete_cookie("g_state")
+    resp.delete_cookie("g_verifier")
+    resp.delete_cookie("sb_uid")
+    return resp
+
+@app.get("/auth/google/status")
+def google_status(current_user: UserIdentity = Depends(get_current_user)):
+    return {"connected": bool(_get_google_refresh_token(current_user.user_id))}
 
 # ---------- me ----------
 @app.get("/me")
@@ -546,6 +935,136 @@ async def get_me(current_user: UserIdentity = Depends(get_current_user)):
         "recruiter": None,
         "company": None,
         "has_company": False,
+    }
+
+@app.get("/recruiter/interviews/today")
+async def list_recruiter_interviews_today(
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    """
+    For the logged-in recruiter, list INTERVIEW_SCHEDULED interviews for *today*
+    across all jobs they created.
+
+    Returns: candidate name, job title, interviewer name, date, time, status, meet link.
+    """
+    # 1) All jobs created by this recruiter
+    jobs = (
+        supabase.table("jobs")
+        .select("job_id, role")
+        .eq("created_by", current_user.user_id)
+        .execute()
+        .data
+        or []
+    )
+    if not jobs:
+        return {
+            "date": datetime.date.today().isoformat(),
+            "count": 0,
+            "interviews": [],
+        }
+
+    job_ids = [j["job_id"] for j in jobs]
+    jobs_by_id = {j["job_id"]: j for j in jobs}
+
+    # 2) Today's window in IST, converted to UTC
+    day, start_iso, end_iso = _today_bounds_for_tz("Asia/Kolkata")
+
+    # 3) Interviews for those jobs today, scheduled
+    rows = (
+        supabase.table("interviews")
+        .select(
+            "interview_id, job_id, resume_id, interviewer_id, "
+            "status, start_at, end_at, google_meet_link, google_html_link"
+        )
+        .in_("job_id", job_ids)
+        .eq("status", "INTERVIEW_SCHEDULED")
+        .gte("start_at", start_iso)
+        .lt("start_at", end_iso)
+        .order("start_at", desc=False)
+        .execute()
+        .data
+        or []
+    )
+
+    if not rows:
+        return {
+            "date": day.isoformat(),
+            "count": 0,
+            "interviews": [],
+        }
+
+    # 4) Bulk fetch resumes (candidate) and interviewers
+    resume_ids = sorted({r["resume_id"] for r in rows if r.get("resume_id")})
+    interviewer_ids = sorted({r["interviewer_id"] for r in rows if r.get("interviewer_id")})
+
+    resumes_by_id: Dict[str, Dict[str, Any]] = {}
+    interviewers_by_id: Dict[str, Dict[str, Any]] = {}
+
+    if resume_ids:
+        res_rows = (
+            supabase.table("resumes")
+            .select("resume_id, full_name, email")
+            .in_("resume_id", resume_ids)
+            .execute()
+            .data
+            or []
+        )
+        resumes_by_id = {r["resume_id"]: r for r in res_rows}
+
+    if interviewer_ids:
+        intv_rows = (
+            supabase.table("interviewers")
+            .select("interviewer_id, name, email")
+            .in_("interviewer_id", interviewer_ids)
+            .execute()
+            .data
+            or []
+        )
+        interviewers_by_id = {i["interviewer_id"]: i for i in intv_rows}
+
+    items = []
+    for r in rows:
+        job = jobs_by_id.get(r["job_id"])
+        res = resumes_by_id.get(r["resume_id"])
+        intv = interviewers_by_id.get(r["interviewer_id"])
+
+        start_at = r.get("start_at")
+        end_at = r.get("end_at")
+
+        date_str = None
+        time_str = None
+        if isinstance(start_at, str):
+            try:
+                date_part, time_part = start_at.split("T", 1)
+                date_str = date_part
+                time_str = time_part[:5]
+            except ValueError:
+                date_str = start_at
+
+        items.append(
+            {
+                "interview_id": r["interview_id"],
+                "candidate_name": (res or {}).get("full_name"),
+                "candidate_email": (res or {}).get("email"),
+                "job_id": r.get("job_id"),
+                "job_title": (job or {}).get("role"),
+                "interviewer_id": r.get("interviewer_id"),
+                "interviewer_name": (intv or {}).get("name"),
+                "interviewer_email": (intv or {}).get("email"),
+                "date": date_str or day.isoformat(),
+                "time": time_str,
+                "status": r.get("status"),
+                "meet_link": r.get("google_meet_link"),
+                "calendar_link": r.get("google_html_link"),
+                "start_at": start_at,
+                "end_at": end_at,
+            }
+        )
+
+    return {
+        "date": day.isoformat(),
+        "count": len(items),
+        "interviews": items,
     }
 
 # ---------- company ----------
@@ -971,7 +1490,7 @@ def _ollama_generate(prompt: str) -> str:
     return generate_jd_with_ollama(prompt)
 
 # Prompts
-ALLOWED_RESUME_STATUSES = {"PENDING", "PARSED", "REJECTED"}
+ALLOWED_RESUME_STATUSES = {"PENDING", "PARSED", "REJECTED","SHORTLISTED","INTERVIEW_SCHEDULED"}
 
 EXTRACT_PROMPT = (
     "You are a resume parsing assistant. Return ONLY JSON with these exact top-level keys: "
@@ -1126,6 +1645,22 @@ def parse_resume_structured(resume_text: str) -> dict:
     data.setdefault("certifications", [])
     data["skills"] = _normalize_skills_block(data.get("skills") or {})
     return data
+
+def _ollama_json(prompt: str) -> dict:
+    """
+    Call Ollama and best-effort parse JSON out of the response,
+    using the same fragment/tidy helpers as the resume parser.
+    """
+    raw = _ollama_generate(prompt)
+    frag = _json_fragment(raw)
+    try:
+        return json.loads(frag)
+    except Exception:
+        try:
+            return json.loads(_tidy_json(frag))
+        except Exception:
+            # Fallback: surface raw text so the UI can still show something
+            return {"raw_text": raw}
 
 # ====== end LLM helpers block ======
 
@@ -1285,7 +1820,6 @@ async def parse_pending(
 
     return {"status": "ok", "parsed": parsed, "errors": errors, "remaining_estimate": max(0, len(pending) - parsed)}
 
-
 def _insert_or_update_resume(job: dict, pdf_text: str, email_hint: Optional[str]):
     # ---- email (unchanged) ----
     m = re.search(r"[\w\.-]+@[\w\.-]+\.\w+", pdf_text or "")
@@ -1336,7 +1870,6 @@ def _insert_or_update_resume(job: dict, pdf_text: str, email_hint: Optional[str]
         job.get("max_years"),
     )
 
-
     # ---- upsert resume row (unique: job_id + email) ----
     supabase.table("resumes").upsert(
         {
@@ -1372,16 +1905,21 @@ def _insert_or_update_resume(job: dict, pdf_text: str, email_hint: Optional[str]
     ).execute()
 
 def _ensure_company(user: UserIdentity) -> Dict[str, Any]:
-    rec = (
+    """
+    Ensures that the current authenticated user has a recruiter/company row.
+    Returns the recruiter row (at least containing company_id), or 400 otherwise.
+    """
+    rec = _first_row(
         supabase.table("recruiters")
         .select("company_id")
         .eq("user_id", user.user_id)
-        .single()
+        .limit(1)
         .execute()
-        .data
     )
+
     if not rec:
         raise HTTPException(400, "Please create company profile first")
+
     return rec
 
 @app.get("/jobs/{job_id}/ranked")
@@ -1442,7 +1980,6 @@ async def rescore_existing(job_id: str, current_user: UserIdentity = Depends(get
         updated += 1
 
     return {"status": "ok", "rescored": updated}
-
 
 @app.post("/storage/cleanup")
 async def cleanup(current_user: UserIdentity = Depends(get_current_user)):
@@ -1616,7 +2153,7 @@ async def invite_interviewer(
     if existing:
         raise HTTPException(409, "Interviewer with this email already exists in this company")
 
-    admin = supabase.auth.admin
+    admin = admin_sb.auth.admin
 
     # 1) Send an invite email (Supabase sends it via SMTP)
     # NOTE: 'options' shape varies with library versions, we handle both.
@@ -1659,8 +2196,6 @@ async def invite_interviewer(
         "company_id": row.get("company_id"),
         "is_active": row.get("is_active", True),
     }
-
-
 
 @app.get("/interviewers", response_model=List[InterviewerOut])
 async def list_interviewers(
@@ -1709,85 +2244,81 @@ async def list_interviewers(
 # Read one
 @app.get("/interviewers/{interviewer_id}", response_model=InterviewerOut)
 async def get_interviewer(
-    interviewer_id: str,
+    interviewer_id: UUID,
     current_user: UserIdentity = Depends(get_current_user),
 ):
-    company_id = _get_company_id_for_user(current_user)
-    row = (
+    rec = _ensure_company(current_user)
+    company_id = rec["company_id"]
+
+    row = _first_row(
         supabase.table("interviewers")
         .select("interviewer_id, name, email, company_id, is_active")
-        .eq("interviewer_id", interviewer_id)
+        .eq("interviewer_id", str(interviewer_id))
         .eq("company_id", company_id)
-        .single()
+        .limit(1)
         .execute()
-        .data
     )
+
     if not row:
         raise HTTPException(404, "Interviewer not found")
+
     return row
 
-
 # Update
-@app.put("/interviewers/{interviewer_id}", response_model=InterviewerOut)
+@app.patch("/interviewers/{interviewer_id}", response_model=InterviewerOut)
 async def update_interviewer(
-    interviewer_id: str,
+    interviewer_id: UUID,
     body: InterviewerUpdate,
     current_user: UserIdentity = Depends(get_current_user),
 ):
     rec = _ensure_company(current_user)
     company_id = rec["company_id"]
 
-    # 1) Fetch current row to get auth_user_id
-    existing = (
+    existing = _first_row(
         supabase.table("interviewers")
         .select("interviewer_id, auth_user_id, name, email, company_id, is_active")
-        .eq("interviewer_id", interviewer_id)
+        .eq("interviewer_id", str(interviewer_id))
         .eq("company_id", company_id)
-        .single()
+        .limit(1)
         .execute()
-        .data
     )
+
     if not existing:
         raise HTTPException(404, "Interviewer not found")
 
-    updates: Dict[str, Any] = {}
-    if body.name is not None:
-        updates["name"] = body.name.strip()
-    if body.email is not None:
-        updates["email"] = body.email.lower()
-    if body.is_active is not None:
-        updates["is_active"] = bool(body.is_active)
+    update_data = body.dict(exclude_unset=True)
 
-    if not updates:
-        return existing  # nothing to do
+    if "email" in update_data and update_data["email"]:
+        update_data["email"] = update_data["email"].lower()
 
-    # 2) Update Auth user (only if name/email changed)
-    admin = supabase.auth.admin
-    auth_updates: Dict[str, Any] = {}
-    if "name" in updates:
-        auth_updates.setdefault("user_metadata", {})["name"] = updates["name"]
-    if "email" in updates:
-        auth_updates["email"] = updates["email"]
+    # Sync email to auth user if there is a linked auth_user_id
+    if existing.get("auth_user_id") and "email" in update_data:
+        try:
+            admin_sb.auth.admin.update_user_by_id(
+                existing["auth_user_id"],
+                {"email": update_data["email"]},
+            )
+        except Exception as e:
+            raise HTTPException(
+                500, f"Failed to update auth user email: {e}"
+            )
 
-    if auth_updates:
-        admin.update_user_by_id(existing["auth_user_id"], auth_updates)
+    if not update_data:
+        # Nothing to update; just return the existing record
+        return existing
 
-    # 3) Update your row
-    row = (
+    updated_rows = (
         supabase.table("interviewers")
-        .update(updates)
-        .eq("interviewer_id", interviewer_id)
+        .update(update_data)
+        .eq("interviewer_id", str(interviewer_id))
         .eq("company_id", company_id)
         .execute()
-        .data[0]
+        .data
     )
-    return {
-        "interviewer_id": row["interviewer_id"],
-        "name": row["name"],
-        "email": row["email"],
-        "company_id": row.get("company_id"),
-        "is_active": row.get("is_active", True),
-    }
+
+    # Supabase update returns a list
+    return updated_rows[0] if updated_rows else existing
+
 
 @app.post("/interviewers/{interviewer_id}/deactivate")
 async def deactivate_interviewer(
@@ -1809,7 +2340,7 @@ async def deactivate_interviewer(
     if not row:
         raise HTTPException(404, "Interviewer not found")
 
-    admin = supabase.auth.admin
+    admin = admin_sb.auth.admin
     # Mark blocked in app_metadata (enforce in RLS or app logic)
     admin.update_user_by_id(row["auth_user_id"], {"app_metadata": {"blocked": True}})
     supabase.table("interviewers").update({"is_active": False}).eq("interviewer_id", interviewer_id).execute()
@@ -1835,11 +2366,10 @@ async def reactivate_interviewer(
     if not row:
         raise HTTPException(404, "Interviewer not found")
 
-    admin = supabase.auth.admin
+    admin = admin_sb.auth.admin
     admin.update_user_by_id(row["auth_user_id"], {"app_metadata": {"blocked": False}})
     supabase.table("interviewers").update({"is_active": True}).eq("interviewer_id", interviewer_id).execute()
     return {"message": "Interviewer reactivated"}
-
 
 @app.delete("/interviewers/{interviewer_id}")
 async def delete_interviewer(
@@ -1874,7 +2404,7 @@ async def delete_interviewer(
 
 @app.post("/interviewers/{interviewer_id}/send-reset", response_model=SendResetOut)
 async def send_reset_link(
-    interviewer_id: str,
+    interviewer_id: UUID,
     current_user: UserIdentity = Depends(get_current_user),
 ):
     rec = _ensure_company(current_user)
@@ -1883,7 +2413,7 @@ async def send_reset_link(
     row = (
         supabase.table("interviewers")
         .select("email")
-        .eq("interviewer_id", interviewer_id)
+        .eq("interviewer_id", str(interviewer_id))
         .eq("company_id", company_id)
         .single()
         .execute()
@@ -1893,27 +2423,15 @@ async def send_reset_link(
         raise HTTPException(404, "Interviewer not found")
 
     email = row["email"].lower()
+    _send_supabase_password_reset(email)
 
-    # supabase-py differs by version; try the common names in order
-    try:
-        supabase.auth.reset_password_for_email(email, options={"redirect_to": RESET_REDIRECT})
-    except AttributeError:
-        try:
-            supabase.auth.reset_password_for_email(email, {"redirect_to": RESET_REDIRECT})
-        except Exception:
-            # fallback name in some builds
-            supabase.auth.reset_password_email(email, {"redirect_to": RESET_REDIRECT})
-
-    # For UX, return a generic message; the actual email is sent by Supabase.
     return {"action_link": f"(email sent) redirect_to={RESET_REDIRECT}"}
 
 @app.post("/auth/interviewer/signin", response_model=InterviewerSessionOut)
 async def interviewer_signin(body: InterviewerSignIn):
     try:
         # 1) sign in with email/password
-        resp = supabase.auth.sign_in_with_password(
-            {"email": body.email, "password": body.password}
-        )
+        resp = public_sb.auth.sign_in_with_password({"email": body.email, "password": body.password})
         if not resp.session or not resp.user:
             raise HTTPException(status_code=401, detail="Invalid credentials")
 
@@ -1966,14 +2484,14 @@ async def interviewer_signin(body: InterviewerSignIn):
 
 @app.get("/interviewer/me")
 async def interviewer_me(current_user: UserIdentity = Depends(get_current_user)):
-    row = (
+    resp = (
         supabase.table("interviewers")
         .select("interviewer_id, name, email, company_id, is_active")
         .eq("auth_user_id", current_user.user_id)
-        .single()
+        .limit(1)
         .execute()
-        .data
     )
+    row = _first_row(resp)
     if not row:
         raise HTTPException(status_code=404, detail="Interviewer profile not found")
     if not row.get("is_active", True):
@@ -1983,10 +2501,886 @@ async def interviewer_me(current_user: UserIdentity = Depends(get_current_user))
         "interviewer": row,
     }
 
+@app.get("/interviewer/interviews/today")
+async def list_my_interviews_today(
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    """
+    For the logged-in interviewer, list all INTERVIEW_SCHEDULED interviews for *today*
+    (using Asia/Kolkata as the logical day).
+    Returns: candidate name, job title, date, time, status, Google Meet link, etc.
+    """
+    # 1) Find interviewer row from auth_user_id
+    interviewer = (
+        supabase.table("interviewers")
+        .select("interviewer_id, name, email, company_id, is_active")
+        .eq("auth_user_id", current_user.user_id)
+        .single()
+        .execute()
+        .data
+    )
+    if not interviewer:
+        raise HTTPException(status_code=404, detail="Interviewer profile not found")
+    if not interviewer.get("is_active", True):
+        raise HTTPException(status_code=403, detail="Interviewer is deactivated")
+
+    interviewer_id = interviewer["interviewer_id"]
+
+    # 2) Today's window in IST, converted to UTC for DB filtering
+    day, start_iso, end_iso = _today_bounds_for_tz("Asia/Kolkata")
+
+    # 3) Fetch today's scheduled interviews for this interviewer
+    rows = (
+        supabase.table("interviews")
+        .select(
+            "interview_id, job_id, resume_id, status, "
+            "start_at, end_at, google_meet_link, google_html_link"
+        )
+        .eq("interviewer_id", interviewer_id)
+        .eq("status", "INTERVIEW_SCHEDULED")
+        .gte("start_at", start_iso)
+        .lt("start_at", end_iso)
+        .order("start_at", desc=False)
+        .execute()
+        .data
+        or []
+    )
+
+    # 4) Bulk fetch jobs + resumes for names/titles
+    job_ids = sorted({r["job_id"] for r in rows if r.get("job_id")})
+    resume_ids = sorted({r["resume_id"] for r in rows if r.get("resume_id")})
+
+    jobs_by_id: Dict[str, Dict[str, Any]] = {}
+    resumes_by_id: Dict[str, Dict[str, Any]] = {}
+
+    if job_ids:
+        jobs = (
+            supabase.table("jobs")
+            .select("job_id, role")
+            .in_("job_id", job_ids)
+            .execute()
+            .data
+            or []
+        )
+        jobs_by_id = {j["job_id"]: j for j in jobs}
+
+    if resume_ids:
+        res_rows = (
+            supabase.table("resumes")
+            .select("resume_id, full_name, email")
+            .in_("resume_id", resume_ids)
+            .execute()
+            .data
+            or []
+        )
+        resumes_by_id = {r["resume_id"]: r for r in res_rows}
+
+    items = []
+    for r in rows:
+        job = jobs_by_id.get(r["job_id"]) if r.get("job_id") else None
+        res = resumes_by_id.get(r["resume_id"]) if r.get("resume_id") else None
+
+        start_at = r.get("start_at")
+        end_at = r.get("end_at")
+
+        date_str = None
+        time_str = None
+        if isinstance(start_at, str):
+            # naive string split: 2025-11-18T10:30:00+05:30
+            try:
+                date_part, time_part = start_at.split("T", 1)
+                date_str = date_part
+                time_str = time_part[:5]  # HH:MM
+            except ValueError:
+                date_str = start_at
+
+        items.append(
+            {
+                "interview_id": r["interview_id"],
+                "candidate_name": (res or {}).get("full_name"),
+                "candidate_email": (res or {}).get("email"),
+                "job_title": (job or {}).get("role"),
+                "date": date_str or day.isoformat(),
+                "time": time_str,
+                "status": r.get("status"),
+                "meet_link": r.get("google_meet_link"),
+                "calendar_link": r.get("google_html_link"),
+                "start_at": start_at,
+                "end_at": end_at,
+            }
+        )
+
+    return {
+        "date": day.isoformat(),
+        "count": len(items),
+        "interviewer": {
+            "interviewer_id": interviewer_id,
+            "name": interviewer.get("name"),
+            "email": interviewer.get("email"),
+        },
+        "interviews": items,
+    }
+
+@app.get("/interviewer/interviews")
+async def list_my_interviews(
+    status: Optional[str] = Query(
+        None,
+        description="Optional: filter by interview status (e.g. INTERVIEW_SCHEDULED, INTERVIEW_DONE, etc.)"
+    ),
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    """
+    List all interviews assigned to the logged-in interviewer.
+    Uses 'interviews' table and joins job + resume info in Python.
+    """
+    interviewer = _get_interviewer_by_auth_user(current_user)
+    interviewer_id = interviewer["interviewer_id"]
+
+    # Base query: all interviews for this interviewer
+    q = (
+        supabase.table("interviews")
+        .select("interview_id, job_id, resume_id, status, start_at, end_at, google_meet_link, google_html_link")
+        .eq("interviewer_id", interviewer_id)
+    )
+    if status:
+        q = q.eq("status", status)
+
+    # Sort by start time (soonest first)
+    try:
+        q = q.order("start_at", desc=False)
+    except Exception:
+        pass
+
+    interviews = q.execute().data or []
+
+    # ---- Bulk-load jobs + resumes to avoid N+1 queries ----
+    job_ids = sorted({i["job_id"] for i in interviews if i.get("job_id")})
+    resume_ids = sorted({i["resume_id"] for i in interviews if i.get("resume_id")})
+
+    jobs_by_id: Dict[str, Dict[str, Any]] = {}
+    resumes_by_id: Dict[str, Dict[str, Any]] = {}
+
+    if job_ids:
+        jobs = (
+            supabase.table("jobs")
+            .select("job_id, role, location")
+            .in_("job_id", job_ids)
+            .execute()
+            .data
+            or []
+        )
+        jobs_by_id = {j["job_id"]: j for j in jobs}
+
+    if resume_ids:
+        res_rows = (
+            supabase.table("resumes")
+            .select("resume_id, full_name, email")
+            .in_("resume_id", resume_ids)
+            .execute()
+            .data
+            or []
+        )
+        resumes_by_id = {r["resume_id"]: r for r in res_rows}
+
+    # Build response list
+    items = []
+    for row in interviews:
+        job = jobs_by_id.get(row["job_id"]) if row.get("job_id") else None
+        res = resumes_by_id.get(row["resume_id"]) if row.get("resume_id") else None
+        items.append(
+            {
+                "interview_id": row["interview_id"],
+                "job_id": row.get("job_id"),
+                "resume_id": row.get("resume_id"),
+                "status": row.get("status"),
+                "start_at": row.get("start_at"),
+                "end_at": row.get("end_at"),
+                # meet + calendar link from interviews table
+                "meet_link": row.get("google_meet_link"),
+                "calendar_link": row.get("google_html_link"),
+                # summary info for UI
+                "job_role": (job or {}).get("role"),
+                "job_location": (job or {}).get("location"),
+                "candidate_name": (res or {}).get("full_name"),
+                "candidate_email": (res or {}).get("email"),
+            }
+        )
+
+    return {
+        "interviewer": {
+            "interviewer_id": interviewer_id,
+            "name": interviewer.get("name"),
+            "email": interviewer.get("email"),
+        },
+        "count": len(items),
+        "interviews": items,
+    }
+
+@app.get("/interviewer/interviews/{interview_id}")
+async def get_interview_detail(
+    interview_id: str,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    """
+    Detailed view for a single interview assigned to this interviewer.
+    - Loads interview from interviews table
+    - Loads JD from jobs table (via job_id)
+    - Loads resume & AI summary from resumes table (via resume_id)
+    - Optionally enriches with candidates table if linked
+    """
+    interviewer = _get_interviewer_by_auth_user(current_user)
+    interviewer_id = interviewer["interviewer_id"]
+
+    # Interview must belong to this interviewer
+    interview = _first_row(
+        supabase.table("interviews")
+        .select("*")
+        .eq("interview_id", interview_id)
+        .eq("interviewer_id", interviewer_id)
+        .limit(1)
+        .execute()
+    )
+    if not interview:
+        raise HTTPException(status_code=404, detail="Interview not found")
+
+    # JD from jobs
+    job = _first_row(
+        supabase.table("jobs")
+        .select("job_id, role, location, employment_type, work_mode, jd_text")
+        .eq("job_id", interview["job_id"])
+        .limit(1)
+        .execute()
+    )
+
+    # Resume from resumes
+    resume_row = _first_row(
+        supabase.table("resumes")
+        .select(
+            "resume_id, candidate_id, full_name, email, phone, location, "
+            "raw_text, ai_summary, skills, experience, education, projects, "
+            "certifications, jd_match_score, skill_match_score, experience_match_score"
+        )
+        .eq("resume_id", interview["resume_id"])
+        .limit(1)
+        .execute()
+    )
+
+    # Optional candidate profile (if candidate_id present)
+    candidate = None
+    if resume_row and resume_row.get("candidate_id"):
+        candidate = _first_row(
+            supabase.table("candidates")
+            .select("candidate_id, first_name, last_name, full_name, email, phone, location, links")
+            .eq("candidate_id", resume_row["candidate_id"])
+            .limit(1)
+            .execute()
+        )
+
+    return {
+        "interview": {
+            "interview_id": interview["interview_id"],
+            "status": interview.get("status"),
+            "start_at": interview.get("start_at"),
+            "end_at": interview.get("end_at"),
+            "meet_link": interview.get("google_meet_link"),
+            "calendar_link": interview.get("google_html_link"),
+        },
+        "job": job,              # includes jd_text
+        "resume": resume_row,    # includes raw_text + ai_summary + structured fields
+        "candidate": candidate,  # optional
+    }
+
+# ===================== INTERVIEW COPILOT =====================
+
+@app.get("/copilot/interviews/{interview_id}/bootstrap")
+async def copilot_bootstrap(
+    interview_id: str,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    """
+    Prepare full context for a live interview:
+    - Candidate summary
+    - JD summary
+    - Suggested interview flow
+    - Rubric
+    - Starter questions
+    """
+    ctx = _get_interview_context(interview_id, current_user)
+    job = ctx["job"]
+    resume = ctx["resume"]
+    meta = ctx["meta"]
+    must = ctx["must"]
+    nice = ctx["nice"]
+
+    job_role = job.get("role") or "Interview"
+    jd_text = job.get("jd_text") or ""
+    candidate_name = (
+        resume.get("full_name")
+        or resume.get("candidate_name")
+        or resume.get("email")
+    )
+    candidate_email = resume.get("email")
+
+    prompt = f"""
+You are an AI interview copilot assisting a human interviewer.
+
+Use the following context to prepare for the interview.
+
+JOB:
+- Title: {job_role}
+- Location: {job.get('location')}
+- Employment type: {job.get('employment_type')}
+- Work mode: {job.get('work_mode')}
+- Must-have skills: {', '.join(must or [])}
+- Nice-to-have skills: {', '.join(nice or [])}
+
+JOB DESCRIPTION:
+{jd_text[:4000]}
+
+CANDIDATE (from resume):
+- Name: {candidate_name}
+- Email: {candidate_email}
+- Location: {resume.get('location')}
+- Existing AI summary (if any): {(resume.get('ai_summary') or '')[:1500]}
+
+STRUCTURED RESUME FIELDS (truncated JSON):
+skills: {(json.dumps(resume.get('skills') or {}, ensure_ascii=False))[:1500]}
+experience: {(json.dumps((resume.get('experience') or [])[:5], ensure_ascii=False))[:2000]}
+education: {(json.dumps((resume.get('education') or [])[:3], ensure_ascii=False))[:800]}
+
+MATCH METRICS:
+- jd_match_score: {resume.get('jd_match_score')}
+- skill_match_score: {resume.get('skill_match_score')}
+- experience_match_score: {resume.get('experience_match_score')}
+- total_experience_years (if known): {meta.get('total_experience_years')}
+
+Return ONLY JSON with these exact top-level keys:
+- candidate_summary: string (Markdown, 3–5 bullet points with the strongest signals)
+- jd_summary: string (Markdown, 3–5 bullet points explaining what this role really needs)
+- suggested_flow: array of objects with keys:
+    - section: string (e.g. "Intro", "Deep dive in backend APIs")
+    - goal: string (what the interviewer should achieve in this section)
+    - minutes: integer (approx. time in minutes)
+- rubric: object mapping competency name to an object:
+    - what_good_looks_like: string
+    - scale: string describing 1–5 expectations
+- starter_questions: array of ~8 concrete, actionable interview questions tailored
+  to this role and candidate.
+
+Do not include any other keys.
+Do not include comments or extra text outside the JSON.
+    """.strip()
+
+    data = _ollama_json(prompt)
+
+    return {
+        "interview_id": interview_id,
+        "job": {
+            "role": job_role,
+            "location": job.get("location"),
+            "employment_type": job.get("employment_type"),
+            "work_mode": job.get("work_mode"),
+            "must_have": must,
+            "nice_to_have": nice,
+        },
+        "candidate": {
+            "name": candidate_name,
+            "email": candidate_email,
+            "location": resume.get("location"),
+        },
+        "copilot": data,
+    }
+
+
+@app.post("/copilot/interviews/{interview_id}/suggest-question")
+async def copilot_suggest_question(
+    interview_id: str,
+    body: CopilotQuestionIn,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    """
+    Suggest the next question to ask, given:
+    - JD + resume context
+    - Optional transcript so far
+    - Optional focus area
+    """
+    ctx = _get_interview_context(interview_id, current_user)
+    job = ctx["job"]
+    resume = ctx["resume"]
+    must = ctx["must"]
+    nice = ctx["nice"]
+
+    job_role = job.get("role") or "Interview"
+    jd_text = job.get("jd_text") or ""
+    candidate_name = (
+        resume.get("full_name")
+        or resume.get("candidate_name")
+        or resume.get("email")
+    )
+
+    transcript = (body.transcript_so_far or "").strip()
+    focus = (body.focus or "").strip()
+
+    prompt = f"""
+You are an AI interview copilot helping a human interviewer decide the NEXT question.
+
+CONTEXT:
+- Role: {job_role}
+- Must-have skills: {', '.join(must or [])}
+- Nice-to-have skills: {', '.join(nice or [])}
+
+JOB DESCRIPTION (truncated):
+{jd_text[:2000]}
+
+CANDIDATE:
+- Name: {candidate_name}
+- Email: {resume.get('email')}
+- Location: {resume.get('location')}
+
+STRUCTURED RESUME (truncated JSON):
+skills: {(json.dumps(resume.get('skills') or {}, ensure_ascii=False))[:1200]}
+experience: {(json.dumps((resume.get('experience') or [])[:5], ensure_ascii=False))[:1800]}
+
+TRANSCRIPT SO FAR:
+{transcript if transcript else "(no transcript provided)"}
+
+FOCUS AREA (if any):
+{focus if focus else "(none specified)"}
+
+Return ONLY JSON with these exact top-level keys:
+- question: string, the next question to ask (clear, concise, and specific)
+- type: string, one of ["behavioral", "technical", "system_design", "communication", "culture"]
+- rationale: short string explaining why this is a good next question
+- follow_ups: array of 2–4 short follow-up questions the interviewer can use
+
+No extra keys and no extra text outside the JSON.
+    """.strip()
+
+    data = _ollama_json(prompt)
+    return {
+        "interview_id": interview_id,
+        "suggestion": data,
+    }
+
+
+@app.post("/copilot/interviews/{interview_id}/summarize-answer")
+async def copilot_summarize_answer(
+    interview_id: str,
+    body: CopilotAnswerIn,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    """
+    Summarize a single answer into:
+    - Bullet notes
+    - Score hints per dimension
+    - Risk flags & suggested follow-ups
+    """
+    ctx = _get_interview_context(interview_id, current_user)
+    job = ctx["job"]
+    resume = ctx["resume"]
+
+    job_role = job.get("role") or "Interview"
+    dim = (body.dimension or "").strip()
+
+    prompt = f"""
+You are an AI note-taking assistant for a technical interview.
+
+JOB ROLE: {job_role}
+
+CANDIDATE:
+- Name: {resume.get('full_name') or resume.get('email')}
+- Email: {resume.get('email')}
+
+QUESTION ASKED:
+{body.question}
+
+CANDIDATE ANSWER (verbatim):
+{body.raw_answer}
+
+DIMENSION (if provided) indicates which competency this question targets, e.g.
+"problem_solving", "system_design", "communication", "culture", "leadership".
+Dimension provided: {dim if dim else "(none specified, infer from the content if possible)"}
+
+Return ONLY JSON with these exact top-level keys:
+- notes_markdown: string (3–8 bullet points in Markdown capturing key facts, signals, and examples)
+- scores: object mapping dimension name (e.g. "problem_solving") to an integer 1–5
+- risk_flags: array of short strings describing any concerns or red flags; empty array if none
+- follow_up_suggestions: array of 2–4 follow-up questions the interviewer could ask next
+
+No extra keys, no comments, and no text outside the JSON.
+    """.strip()
+
+    data = _ollama_json(prompt)
+    return {
+        "interview_id": interview_id,
+        "analysis": data,
+    }
+
+
+@app.post("/copilot/interviews/{interview_id}/final-report")
+async def copilot_final_report(
+    interview_id: str,
+    body: CopilotFinalIn,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    """
+    Generate a concise final report after the interview:
+    - Overall summary
+    - Strengths / weaknesses
+    - Risk flags
+    - Recommended decision
+    """
+    ctx = _get_interview_context(interview_id, current_user)
+    job = ctx["job"]
+    resume = ctx["resume"]
+
+    job_role = job.get("role") or "Interview"
+    notes = (body.notes or "").strip()
+    decision = (body.decision or "").strip()
+    ratings = body.ratings or {}
+
+    prompt = f"""
+You are an AI assistant helping an interviewer write a final evaluation.
+
+JOB:
+- Role: {job_role}
+- Location: {job.get('location')}
+- Employment type: {job.get('employment_type')}
+- Work mode: {job.get('work_mode')}
+
+CANDIDATE:
+- Name: {resume.get('full_name') or resume.get('email')}
+- Email: {resume.get('email')}
+- Location: {resume.get('location')}
+
+MATCH METRICS:
+- jd_match_score: {resume.get('jd_match_score')}
+- skill_match_score: {resume.get('skill_match_score')}
+- experience_match_score: {resume.get('experience_match_score')}
+
+EXISTING AI RESUME SUMMARY (if any):
+{(resume.get('ai_summary') or '')[:1500]}
+
+INTERVIEWER NOTES (raw text, may be messy):
+{notes if notes else "(no extra notes provided)"}
+
+INTERVIEWER DECISION (if provided):
+{decision if decision else "(no explicit decision yet)"}
+
+INTERVIEWER RATINGS (JSON, if provided):
+{json.dumps(ratings, ensure_ascii=False)}
+
+Return ONLY JSON with these exact top-level keys:
+- summary_markdown: short Markdown summary (max ~250 words) with clear sections:
+    - "Overall impression"
+    - "Strengths"
+    - "Concerns"
+- recommended_decision: one of ["strong_hire", "hire", "no_hire", "unsure"]
+- justification: 2–4 bullet points explaining the recommendation
+- coaching_for_next_round: 2–5 bullet points suggesting what next-round interviewers should focus on
+
+No extra keys and no text outside the JSON.
+    """.strip()
+
+    data = _ollama_json(prompt)
+
+    return {
+        "interview_id": interview_id,
+        "final_report": data,
+    }
+
+@app.post("/jobs/{job_id}/resumes/shortlist")
+async def shortlist_resumes(
+    job_id: str,
+    payload: BulkShortlistRequest,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    """
+    Bulk-shortlist candidates for a job.
+    - Accepts either 'resume_ids' or 'emails' (or both).
+    - Default behavior updates rows currently in status == PARSED.
+    - Returns counts for transparency.
+    """
+    # Verify recruiter owns the job
+    _ = _get_job_owned(job_id, current_user)
+
+    ids = [i for i in (payload.resume_ids or []) if i]
+    emails = [e.lower() for e in (payload.emails or []) if e]
+    if not ids and not emails:
+        raise HTTPException(status_code=400, detail="Provide resume_ids and/or emails")
+
+    updated_total = 0
+    skipped = 0
+    errors: List[Dict[str, Any]] = []
+
+    # What we will set
+    new_status = "SHORTLISTED"
+    if new_status not in ALLOWED_RESUME_STATUSES:
+        raise HTTPException(status_code=500, detail="Server not configured for status SHORTLISTED")
+
+    # Update by resume_ids
+    if ids:
+        try:
+            resp = (
+                supabase.table("resumes")
+                .update({"status": new_status})
+                .in_("resume_id", ids)
+                .eq("job_id", job_id)
+                .eq("status", payload.only_if_status)
+                .execute()
+            )
+            updated_total += len(resp.data or [])
+        except Exception as e:
+            errors.append({"by": "resume_ids", "error": str(e)})
+
+    # Update by emails
+    if emails:
+        try:
+            resp = (
+                supabase.table("resumes")
+                .update({"status": new_status})
+                .in_("email", emails)
+                .eq("job_id", job_id)
+                .eq("status", payload.only_if_status)
+                .execute()
+            )
+            updated_total += len(resp.data or [])
+        except Exception as e:
+            errors.append({"by": "emails", "error": str(e)})
+
+    # For visibility, report how many in the selection are currently NOT in only_if_status
+    # (best-effort estimate)
+    try:
+        selected_count = 0
+        if ids:
+            selected_count += (
+                supabase.table("resumes")
+                .select("resume_id", count="exact")
+                .in_("resume_id", ids).eq("job_id", job_id)
+                .execute().count or 0
+            )
+        if emails:
+            selected_count += (
+                supabase.table("resumes")
+                .select("email", count="exact")
+                .in_("email", emails).eq("job_id", job_id)
+                .execute().count or 0
+            )
+        skipped = max(0, selected_count - updated_total)
+    except Exception:
+        # ignore count errors, still return updated_total
+        pass
+
+    return {
+        "job_id": job_id,
+        "new_status": new_status,
+        "updated": updated_total,
+        "skipped_non_matching_status_or_missing": skipped,
+        "errors": errors,
+    }
+
+from postgrest.exceptions import APIError as PgAPIError
+
+@app.post("/interviews/schedule")
+async def schedule_interview(
+    body: ScheduleInterviewIn,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    # Verify recruiter owns the job
+    _ = _get_job_owned(body.job_id, current_user)
+
+    # ---------- candidate (resume) ----------
+    res_row = _first_row(
+        supabase.table("resumes")
+        .select("email, full_name")
+        .eq("resume_id", body.resume_id)
+        .eq("job_id", body.job_id)
+        .limit(1)
+        .execute()
+    )
+    if not res_row:
+        raise HTTPException(404, "Resume not found for job")
+    candidate_email = res_row["email"]
+
+    # ---------- interviewer ----------
+    intv = _first_row(
+        supabase.table("interviewers")
+        .select("email, name")
+        .eq("interviewer_id", body.interviewer_id)
+        .limit(1)
+        .execute()
+    )
+    if not intv:
+        raise HTTPException(404, "Interviewer not found")
+    interviewer_email = intv["email"]
+
+    # ---------- job (and optional company) ----------
+    job = _first_row(
+        supabase.table("jobs")
+        .select("role, company_id")
+        .eq("job_id", body.job_id)
+        .limit(1)
+        .execute()
+    )
+    if not job:
+        raise HTTPException(404, "Job not found")
+
+    comp = None
+    if job.get("company_id"):
+        comp = _first_row(
+            supabase.table("companies")
+            .select("company_name")
+            .eq("company_id", job["company_id"])
+            .limit(1)
+            .execute()
+        )
+
+    role = job.get("role") or "Interview"
+    company_name = (comp or {}).get("company_name") or ""
+    # ✅ this was missing before; you referenced `title` without defining it
+    title = f"{role} Interview" + (f" — {company_name}" if company_name else "")
+
+    # ---------- idempotency check ----------
+    if body.external_id:
+        existing = _first_row(
+            supabase.table("interviews")
+            .select("*")
+            .eq("external_id", body.external_id)
+            .limit(1)
+            .execute()
+        )
+        if existing and existing.get("google_event_id"):
+            return {
+                "status": existing["status"],
+                "calendarId": existing.get("google_html_link"),
+                "meetLink": existing.get("google_meet_link"),
+                "interview_id": existing["interview_id"],
+            }
+
+    # ---------- Google Calendar ----------
+    svc = _google_service_for_user(current_user.user_id)
+
+    # Best-effort free/busy check (skip on error)
+    try:
+        fb_req = {
+            "timeMin": body.start_iso,
+            "timeMax": body.end_iso,
+            "timeZone": body.timezone,
+            "items": [{"id": interviewer_email}, {"id": candidate_email}],
+        }
+        fb = svc.freebusy().query(body=fb_req).execute()
+        busy = []
+        for cal in fb.get("calendars", {}).values():
+            busy.extend(cal.get("busy", []))
+        if busy:
+            return {"status": "CONFLICT", "busy": busy}
+    except Exception:
+        pass
+
+    description = (
+        f"Interview for {role}"
+        + (f" at {company_name}" if company_name else "")
+        + ".\n\nPlease join using the Google Meet link. "
+          "If you need to reschedule, reply to this email.\n\n"
+          "Agenda: 5 min intro, 35 min technical Q&A, 10 min wrap-up.\n"
+          "Kindly accept or decline from the calendar invite."
+    )
+
+    event = {
+        "summary": title,
+        "description": description,
+        "start": {"dateTime": body.start_iso, "timeZone": body.timezone},
+        "end":   {"dateTime": body.end_iso,   "timeZone": body.timezone},
+        "attendees": [
+            {"email": candidate_email},
+            {"email": interviewer_email},
+            {"email": current_user.email},  # recruiter/admin
+        ],
+        "extendedProperties": {"shared": {"externalId": body.external_id or secrets.token_hex(8)}},
+        "conferenceData": {
+            "createRequest": {
+                "requestId": secrets.token_hex(8),
+                "conferenceSolutionKey": {"type": "hangoutsMeet"},
+            }
+        },
+    }
+
+    created = svc.events().insert(
+        calendarId="primary",
+        body=event,
+        conferenceDataVersion=1,
+        sendUpdates="all"
+    ).execute()
+
+    meet = created.get("hangoutLink") or (
+        (created.get("conferenceData", {}).get("entryPoints") or [{}])[0].get("uri")
+    )
+
+    # ---------- persist interview ----------
+    row = (
+        supabase.table("interviews")
+        .insert({
+            "job_id": body.job_id,
+            "resume_id": body.resume_id,
+            "interviewer_id": body.interviewer_id,
+            "candidate_email": candidate_email,
+            "interviewer_email": interviewer_email,
+            "recruiter_email": current_user.email,
+            "status": "INTERVIEW_SCHEDULED",
+            "google_event_id": created["id"],
+            "google_html_link": created.get("htmlLink"),
+            "google_meet_link": meet,
+            "external_id": (body.external_id or event["extendedProperties"]["shared"]["externalId"]),
+            "start_at": body.start_iso,
+            "end_at": body.end_iso,
+            "created_by": current_user.user_id,
+        })
+        .execute()
+        .data[0]
+    )
+
+    # NEW: update resume status
+    try:
+        supabase.table("resumes").update(
+            {"status": "INTERVIEW_SCHEDULED"}
+        ).eq("resume_id", body.resume_id).execute()
+    except Exception as e:
+        print("Non-fatal: failed to update resume status:", e)
+
+    return {
+        "interview_id": row["interview_id"],
+        "status": row["status"],
+        "calendarId": row["google_html_link"],
+        "meetLink": row["google_meet_link"],
+        "flags": {
+            "scheduled":      row["status"] == "INTERVIEW_SCHEDULED",
+            "interview_done": row["status"] == "INTERVIEW_DONE",
+            "select":         row["status"] == "SELECTED",
+            "reject":         row["status"] == "REJECTED",
+            "review":         row["status"] == "REVIEW",
+            "hired":          row["status"] == "HIRED",
+            "absent":         row["status"] == "ABSENT",
+        },
+
+        "attendees": created.get("attendees", []),
+    }
+
+class InterviewStatusIn(BaseModel):
+    status: str  # validate against the enum in code too
+
+@app.post("/interviews/{interview_id}/status")
+async def update_interview_status(interview_id: str, body: InterviewStatusIn,
+                                  current_user: UserIdentity = Depends(get_current_user)):
+    allowed = {"INTERVIEW_SCHEDULED","INTERVIEW_DONE","SELECTED","REJECTED","REVIEW","HIRED","ABSENT","CANCELLED"}
+    if body.status not in allowed:
+        raise HTTPException(400, "Invalid status")
+    row = supabase.table("interviews").update({"status": body.status}).eq("interview_id", interview_id).execute().data
+    if not row:
+        raise HTTPException(404, "Interview not found")
+    return {"interview_id": interview_id, "status": body.status}
 # ---------------------------------------------------------------------------
 # run (local)
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
