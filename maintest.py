@@ -1141,48 +1141,219 @@ def _recent_turns(session_id: str, limit: int = 2000) -> list[dict]:
         candidate_name=candidate_name,
     )
 
-def _coerce_summary_payload(data: dict) -> dict:
+# ─────────────────────────────────────────────
+# Summary payload coercer — ALWAYS return requested JSON shape
+# ─────────────────────────────────────────────
+def _coerce_summary_payload(model_out: Any) -> dict:
     """
-    Make sure the AI summary payload always has a stable shape for the frontend
-    and for storage in meetings.ai_report.
-    Expected shape:
-      {
-        "overall_recommendation": str,
-        "summary": str,
-        "strengths": [str],
-        "weaknesses": [str],
-        "concerns": [str],
-        "suggested_questions": [str],
-        "final_comment": str
-      }
-    Anything missing or of the wrong type is replaced with a safe default.
+    Normalizes the model output into the strict summary shape:
+
+    {
+      "analytics": {
+        "skills_match": int 0-10,
+        "communication_experience": int 0-10,
+        "jd_alignment": int 0-10,
+        "overall_score": int 0-10  # computed as average of the three above
+      },
+      "role_fit": "...",
+      "experience": "...",
+      "strengths": "...",
+      "weaknesses": "...",
+      "interview_summary": "..."
+    }
     """
-    if not isinstance(data, dict):
-        data = {}
+    out = {
+        "analytics": {
+            "skills_match": 0,
+            "communication_experience": 0,
+            "jd_alignment": 0,
+            "overall_score": 0,
+        },
+        "role_fit": "uncertain",
+        "experience": "",
+        "strengths": "",
+        "weaknesses": "",
+        "interview_summary": "",
+    }
 
-    def _as_list(x) -> list[str]:
-        if isinstance(x, list):
-            return [str(i).strip() for i in x if str(i).strip()]
-        if isinstance(x, str) and x.strip():
-            # split bullet-y text into lines
-            parts = re.split(r"[\r\n]+|(?:^|[\s])[-–•·]\s+", x)
-            return [p.strip(" -–•·\t\r\n") for p in parts if p.strip()]
-        return []
+    # If the model just sent a string, treat it as a generic interview summary
+    if isinstance(model_out, str):
+        out["interview_summary"] = model_out.strip()
+        return out
 
-    def _as_str(x) -> str:
-        if isinstance(x, str):
-            return x.strip()
+    if not isinstance(model_out, dict):
+        return out
+
+    analytics = model_out.get("analytics") or {}
+
+    def _to_float(x, default=0.0):
+        try:
+            return float(x)
+        except Exception:
+            return default
+
+    def _clamp10(v: float) -> float:
+        v = float(v)
+        if v < 0:
+            v = 0.0
+        if v > 10:
+            v = 10.0
+        return v
+
+    # Pull scores (allowing for a few alternative names just in case)
+    skills_match = _to_float(analytics.get("skills_match"))
+    comm_exp = _to_float(
+        analytics.get("communication_experience")
+        or analytics.get("communication")
+        or analytics.get("communication_score")
+    )
+    jd_alignment = _to_float(
+        analytics.get("jd_alignment")
+        or analytics.get("jd_fit")
+        or analytics.get("role_fit_score")
+    )
+
+    skills_match = _clamp10(skills_match)
+    comm_exp = _clamp10(comm_exp)
+    jd_alignment = _clamp10(jd_alignment)
+
+    out["analytics"]["skills_match"] = int(round(skills_match))
+    out["analytics"]["communication_experience"] = int(round(comm_exp))
+    out["analytics"]["jd_alignment"] = int(round(jd_alignment))
+
+    # overall_score MUST be the average of the three, if we have any signal
+    scores = [skills_match, comm_exp, jd_alignment]
+    nonzero = [s for s in scores if s > 0]
+    if nonzero:
+        overall = sum(nonzero) / len(nonzero)
+    else:
+        # fall back to model's own overall_score if absolutely nothing else is set
+        overall = _clamp10(_to_float(analytics.get("overall_score"), 0.0))
+    out["analytics"]["overall_score"] = int(round(overall))
+
+    # role_fit: normalize into a small set of labels
+    role_fit = (model_out.get("role_fit") or "").strip().lower()
+    allowed_role_fits = {
+        "perfect fit",
+        "good fit",
+        "partial fit",
+        "uncertain",
+        "not a fit",
+    }
+    if role_fit not in allowed_role_fits:
+        # Try to infer roughly, otherwise keep "uncertain"
+        if "perfect" in role_fit:
+            role_fit = "perfect fit"
+        elif "good" in role_fit:
+            role_fit = "good fit"
+        elif "partial" in role_fit:
+            role_fit = "partial fit"
+        elif "not" in role_fit:
+            role_fit = "not a fit"
+        else:
+            role_fit = "uncertain"
+    out["role_fit"] = role_fit
+
+    # experience: just keep the text the model sends (e.g. fresher / mid level / senior)
+    out["experience"] = str(model_out.get("experience") or "").strip()
+
+    def _coerce_text(v: Any) -> str:
+        if isinstance(v, list):
+            return " ".join(str(x).strip() for x in v if str(x).strip())
+        return str(v or "").strip()
+
+    out["strengths"] = _coerce_text(model_out.get("strengths"))
+    out["weaknesses"] = _coerce_text(model_out.get("weaknesses"))
+    out["interview_summary"] = _coerce_text(model_out.get("interview_summary"))
+
+    return out
+
+
+# ─────────────────────────────────────────────
+# Candidate answer extraction (transcript-only)
+# ─────────────────────────────────────────────
+def _norm(s: str) -> str:
+    s = s.lower().strip()
+    s = re.sub(r"[^a-z0-9\s]+", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def _is_interviewer(t: dict, interviewer_name: str) -> bool:
+    who = (t.get("speaker") or t.get("source") or "").lower()
+    name = (t.get("speaker_name") or "").lower()
+    if "interviewer" in who or "mic" in who:
+        return True
+    if interviewer_name and name and name == interviewer_name.lower():
+        return True
+    return False
+
+
+def _is_candidate(t: dict, candidate_name: str) -> bool:
+    who = (t.get("speaker") or t.get("source") or "").lower()
+    name = (t.get("speaker_name") or "").lower()
+    if "candidate" in who or "tab" in who:
+        return True
+    if candidate_name and name and name == candidate_name.lower():
+        return True
+    return False
+
+
+def _turns_snippet(turns: List[dict], last_n: int = 12) -> str:
+    ctx = turns[-last_n:] if len(turns) > last_n else turns[:]
+    lines = []
+    for t in ctx:
+        who = t.get("speaker_name") or t.get("speaker") or t.get("source", "unknown")
+        text = t.get("text", "")
+        lines.append(f"{who}: {text}")
+    return "\n".join(lines)
+
+
+def _extract_candidate_answer(
+    question_text: str,
+    turns: List[dict],
+    interviewer_name: str = "",
+    candidate_name: str = "",
+) -> str:
+    if not turns:
         return ""
 
-    return {
-        "overall_recommendation": _as_str(data.get("overall_recommendation")),
-        "summary": _as_str(data.get("summary")),
-        "strengths": _as_list(data.get("strengths")),
-        "weaknesses": _as_list(data.get("weaknesses")),
-        "concerns": _as_list(data.get("concerns")),
-        "suggested_questions": _as_list(data.get("suggested_questions")),
-        "final_comment": _as_str(data.get("final_comment")),
-    }
+    qn = _norm(question_text)
+    best_idx, best_score = None, 0.0
+    qtoks = set(qn.split())
+
+    # Find the interviewer turn that best matches the question
+    for i, t in enumerate(turns):
+        if not _is_interviewer(t, interviewer_name):
+            continue
+        tn = _norm(t.get("text", ""))
+        if not tn:
+            continue
+        ttoks = set(tn.split())
+        if not qtoks or not ttoks:
+            continue
+        overlap = len(qtoks & ttoks) / max(1, len(qtoks))
+        if qn in tn or tn in qn:
+            overlap = 1.0
+        if overlap > best_score:
+            best_score, best_idx = overlap, i
+
+    # Collect candidate's answer after that interviewer turn
+    if best_idx is not None:
+        out = []
+        for j in range(best_idx + 1, len(turns)):
+            t = turns[j]
+            if _is_interviewer(t, interviewer_name):
+                break
+            if _is_candidate(t, candidate_name):
+                out.append(t.get("text", ""))
+            if len(out) >= 6:
+                break
+        return " ".join(x.strip() for x in out if x.strip())
+
+    # Fallback: last few candidate turns
+    cand = [t.get("text", "") for t in turns[-10:] if _is_candidate(t, candidate_name)]
+    return " ".join(x.strip() for x in cand if x.strip())
 
 # ---------------------------------------------------------------------------
 # routes (YOUR ORIGINAL ROUTES — UNCHANGED)
@@ -2720,7 +2891,6 @@ async def update_interviewer(
     # Supabase update returns a list
     return updated_rows[0] if updated_rows else existing
 
-
 @app.post("/interviewers/{interviewer_id}/deactivate")
 async def deactivate_interviewer(
     interviewer_id: str,
@@ -3535,8 +3705,6 @@ async def meet_session_start(payload: dict):
 # ADD NEAR OTHER IMPORTS
 from fastapi import Body
 
-# ...
-
 @app.post("/meet/session/bootstrap")
 async def meet_session_bootstrap(
     payload: Dict[str, str] = Body(...),
@@ -3674,10 +3842,11 @@ async def websocket_stt(websocket: WebSocket, source: str):
         print(f"[ws:{source}] done")
 
 @app.post("/ai/summary")
-async def ai_summary(payload: dict = Body(...)):
+async def ai_summary(payload: Dict[str, str] = Body(...)):
     session_id = (payload or {}).get("session_id")
     if not session_id:
         raise HTTPException(400, "session_id required")
+
     meeting = _sb_get_meeting(session_id)
     turns = _recent_turns(session_id, limit=2000)
     resume = meeting.get("resume", "")
@@ -3689,25 +3858,63 @@ async def ai_summary(payload: dict = Body(...)):
     ]
     convo = "\n".join(lines)
 
-    # ... same long prompt as in meetai.py ...
     prompt = f"""
-    You are helping a recruiter. Return STRICT JSON ONLY with exactly these keys:
-    overall_recommendation, summary, strengths, weaknesses, concerns,
-    suggested_questions, final_comment.
+You are helping a recruiter. Return STRICT JSON ONLY with exactly these keys:
 
-    Each key must be present. strengths/weaknesses/concerns/suggested_questions
-    should be arrays of short bullet strings. Do NOT include any extra keys.
+analytics: object with:
+  - skills_match: integer 0–10
+      How well the candidate's REAL skills (from RESUME and what they actually said in the interview(according to the transcript)) match the JD.
+      Do NOT invent skills or experience that are not supported by the resume or transcript.
+  - communication_experience: integer 0–10
+      How clearly the candidate communicates according to the questions asked by the interviewer.
+      If the candidate ahs not responded to the question or no proper conversation went then score 1 .
+  - jd_alignment: integer 0–10
+      How well the RESUME + spoken answers align with the responsibilities and requirements in the JD.
+  - overall_score: integer 0–10
+      Your estimate of overall fit. (The server will recompute this as the average of the first three scores.)
 
-    CONTEXT:
-    - Job description (if provided): {jd[:2000]}
-    - Candidate resume (if provided): {resume[:3000]}
+role_fit: one of
+  "perfect fit", "good fit", "partial fit", "uncertain", "not a fit"
 
-    FULL TRANSCRIPT:
-    {convo}
-    """.strip()
+experience:
+  A short label such as "fresher", "mid level", or "senior", based mainly on RESUME (years/roles) and then interview.
 
+strengths:(write in bullet points)
+  A short, neutral 5-6 line paragraph describing the key strengths shown in the RESUME and INTERVIEW.
+  Focus on real evidence from their background and what they actually said.
 
-    data = _ollama_json(prompt)
+weaknesses:(write in bullet points)
+  A short, constructive 5–6 line paragraph about growth areas.
+  Never be rude or harsh. If information is limited, say that evaluation is limited instead of criticizing.
+  If the candidate does not gave any answer or has not responded to the question then mention it. 
+
+interview_summary:(write in bullet points)
+  A short, neutral 5–6 line paragraph summarizing how the interview went:
+  level of detail in answers, confidence vs confusion, and overall impression.
+  Do NOT assume things that were never said.
+
+IMPORTANT RULES:
+- Use RESUME and FULL TRANSCRIPT as the single source of truth about the candidate.
+- Use the JD only to judge relevance and alignment, NOT to fabricate missing skills.
+- If the candidate spoke very little or gave almost no answers (e.g. mostly interviewer talking, or very short replies),
+  then keep all analytics scores low (e.g. between 1 and 3) and clearly mention that the assessment is limited by lack of data.
+- Do not over-penalize nervousness or minor pauses; focus on the quality and clarity of whatever the candidate actually explained.
+- Be professional, supportive, and non-decisive. The recruiter makes the final decision, you are only assisting.
+- Output JSON only. Do not include any extra text or explanations.
+- If there is very limited conversation happened like (hi , hello , am i audible) , then do write that in the Interview summary and weaknessess.
+- Do not give "\\n" in responses.
+
+RESUME:
+{resume}
+
+JD:
+{jd}
+
+FULL TRANSCRIPT:
+{convo}
+""".strip()
+
+    data = _ollama_chat_json(prompt)
     coerced = _coerce_summary_payload(data)
 
     try:
@@ -3799,191 +4006,200 @@ CONTEXT:
     }
 
 @app.post("/ai/expected")
-async def ai_expected_answer(
-    payload: dict = Body(...),
-):
-    """
-    Given a question + session context, generate an 'ideal' / model answer.
-
-    Expected payload:
-    {
-      "session_id": "uuid",
-      "question": "What is ...?",
-      "dimension": "backend" | "system_design" | ...
-    }
-    """
+async def ai_expected(payload: Dict[str, str] = Body(...)):
     session_id = (payload or {}).get("session_id")
-    question = (payload or {}).get("question")
-    dimension = (payload or {}).get("dimension") or "general"
+    question = (payload or {}).get("question", "").strip()
+    if not session_id or not question:
+        raise HTTPException(400, "session_id and question required")
 
-    if not session_id:
-        raise HTTPException(400, "session_id required")
-    if not question:
-        raise HTTPException(400, "question required")
-
-    ctx = _meet_context_for_session(session_id)
-    jd = ctx["jd"][:2000]
-    resume = ctx["resume"][:3000]
+    meeting = _sb_get_meeting(session_id)
+    resume = meeting.get("resume", "")
+    jd = meeting.get("jd", "")
+    turns = _recent_turns(session_id, 80)
+    convo = _turns_snippet(turns, 12)
 
     prompt = f"""
-{COPILOT_SYSTEM_HINT}
+You are generating an example answer to help THIS candidate improve.
+Return STRICT JSON with exactly one key: expected_answer.
 
-You must return STRICT JSON ONLY with these keys:
+Rules:
+- Use RESUME and RECENT TRANSCRIPT as the SINGLE source of truth about the candidate's background and skills.
+- Do NOT invent technical skills, tools, projects, or years of experience that are not clearly present in the RESUME or mentioned by the candidate.
+- Use the JD only to decide what to emphasize and how to structure the answer, but keep the content honest and realistic for THIS candidate.
+- If the JD asks for skills that the candidate does not have, you may:
+    • Mention genuine interest in learning those areas, OR
+    • Highlight transferable skills from their real experience,
+  but you MUST NOT pretend they already have that experience.
+- The answer should work for both technical and non-technical candidates:
+    use simple, clear language, and avoid heavy jargon.
+- Be supportive and neutral; do not sound judgmental.
 
-- "expected_answer": string (a compact but high-quality ideal answer, 3–8 sentences)
-- "bullets": array of strings (3–7 bullet points capturing key checkpoints)
-- "dimension": string (echo back the dimension you used)
-- "notes": string (short notes for the interviewer)
+Context:
+RESUME:
+{resume}
 
-Question:
-{question}
-
-Dimension: {dimension}
-
-Job description (truncated):
+JD:
 {jd}
 
-Candidate resume (for seniority context, truncated):
-{resume}
+RECENT TRANSCRIPT:
+{convo}
+
+QUESTION TO PREPARE EXPECTED ANSWER FOR:
+{question}
+
+Write a concise but complete expected_answer (bullets or short paragraphs)
+that THIS candidate could realistically say based on their real background.
 """.strip()
 
-    data = _ollama_json(prompt)
-
-    expected_answer = _strip_code_and_json(data.get("expected_answer") or data.get("answer") or "")
-    bullets = data.get("bullets") or data.get("checkpoints") or []
-    if isinstance(bullets, str):
-        bullets = [b.lstrip("-• ").strip() for b in bullets.splitlines() if b.strip()]
-
-    notes = _strip_code_and_json(data.get("notes") or "")
-    dimension_used = (data.get("dimension") or dimension).strip() or "general"
-
-    if not expected_answer:
-        # degrade gracefully: join bullets
-        expected_answer = "\n".join(f"- {b}" for b in bullets) or "Expected answer unavailable."
-
+    data = _ollama_chat_json(prompt)
+    exp_raw = (data.get("expected_answer") or data.get("raw") or "").strip()
     return {
         "session_id": session_id,
         "question": question,
-        "dimension": dimension_used,
-        "expected_answer": expected_answer,
-        "bullets": bullets,
-        "notes": notes,
+        "expected_answer": _to_bullets(exp_raw, max_items=6),
     }
 
 @app.post("/ai/validate")
-async def ai_validate_answer(
-    payload: dict = Body(...),
-):
-    """
-    Compare the candidate's answer to the expected answer and return a score + feedback.
-
-    Expected payload:
-    {
-      "session_id": "uuid",
-      "question": "What is ...?",
-      "raw_answer": "Candidate's transcript / notes",
-      "dimension": "backend" | "system_design" | ...,
-      "expected_answer": "...",      # optional – frontend can pass cached model answer
-      "bullets": [ "...", ... ]      # optional
-    }
-    """
+async def ai_validate(payload: Dict[str, str] = Body(...)):
     session_id = (payload or {}).get("session_id")
-    question = (payload or {}).get("question")
-    raw_answer = (payload or {}).get("raw_answer")
-    dimension = (payload or {}).get("dimension") or "general"
+    question = (payload or {}).get("question", "").strip()
+    if not session_id or not question:
+        raise HTTPException(400, "session_id and question required")
 
-    if not session_id:
-        raise HTTPException(400, "session_id required")
-    if not question:
-        raise HTTPException(400, "question required")
-    if not raw_answer:
-        raise HTTPException(400, "raw_answer required")
+    meeting = _sb_get_meeting(session_id)
+    resume = meeting.get("resume", "")
+    jd = meeting.get("jd", "")
+    turns = _recent_turns(session_id, 300)
 
-    expected_answer = (payload or {}).get("expected_answer") or ""
-    bullets = (payload or {}).get("bullets") or []
-
-    ctx = _meet_context_for_session(session_id)
-    jd = ctx["jd"][:1500]
-    resume = ctx["resume"][:2000]
+    cand_answer = _extract_candidate_answer(
+        question,
+        turns,
+        interviewer_name=(meeting.get("interviewer_name") or ""),
+        candidate_name=(meeting.get("candidate_name") or ""),
+    )
 
     prompt = f"""
-{COPILOT_SYSTEM_HINT}
+You are evaluating a candidate's answer to an interview question.
+Return STRICT JSON with keys:
+- verdict (one of: "STRONG", "OK", "LIMITED")
+- score (0.0–1.0)
+- explanation (1–3 short sentences)
+- expected_answer
+- candidate_answer
 
-You must return STRICT JSON ONLY with these keys:
+Use:
+RESUME:
+{resume}
 
-- "score": integer from 1 to 5 (1=very poor, 3=ok, 5=excellent)
-- "verdict": string – one of: "weak", "mixed", "strong"
-- "summary": string – concise explanation (2–4 sentences) of how good the answer is
-- "strengths": array of strings – concrete positives in the answer
-- "weaknesses": array of strings – concrete gaps / mistakes
-- "followups": array of strings – smart follow-up questions the interviewer could ask
-
-Question:
-{question}
-
-Dimension: {dimension}
-
-Expected/model answer (if given by system, may be empty):
-{expected_answer}
-
-Key checkpoints (if any):
-{ json.dumps(bullets, ensure_ascii=False) }
-
-Candidate's raw answer:
-{raw_answer}
-
-Job description (truncated):
+JD:
 {jd}
 
-Candidate resume (truncated):
-{resume}
+QUESTION:
+{question}
+
+CANDIDATE_ANSWER:
+{cand_answer if cand_answer else "(none)"} 
+
+GUIDELINES:
+
+1) EXPECTED ANSWER:
+   - First infer a good expected_answer using JD + RESUME.
+   - Do NOT invent skills, tools, or experience that contradicts the RESUME.
+   - The expected_answer should be realistic for THIS candidate's background.
+   - Write complete response ,Do NOT write incomplete response. 
+
+2) VERDICT:
+   - "STRONG": Candidate answer is largely correct, relevant, and aligned with the expected_answer.
+   - "OK": Candidate answer is partially correct or high-level, but missing important details OR not very structured.
+   - "LIMITED": Candidate answer is very short, off-topic, clearly incorrect, or contradicts the resume/JD.
+
+   VERY IMPORTANT:
+   - For broad questions like "Tell me about yourself" / "Introduce yourself" / "Walk me through your profile":
+     • If the answer is generally consistent with the resume and JD (even if brief), use at least "OK", not "LIMITED".
+     • Do NOT mark an answer as bad just because it doesn't repeat every project or metric from the resume.
+     • Minor differences in phrasing or missing achievements are acceptable.
+
+3) SCORE:
+   - score is a float between 0.0 and 1.0.
+   - Rough guideline:
+     • STRONG  → score between 0.7 and 1.0
+     • OK      → score between 0.4 and 0.7
+     • LIMITED → score between 0.0 and 0.4
+
+4) TONE:
+   - Be neutral, kind, and constructive.
+   - In the explanation, focus on what was good and what could be improved.
+   - Avoid harsh language like "wrong", "terrible", or personal judgments.
+
+Return ONLY the JSON object, with no extra commentary.
 """.strip()
 
-    data = _ollama_json(prompt)
+    data = _ollama_chat_json(prompt)
+
+    # Softer verdict labels
+    verdict = (data.get("verdict") or "").upper().strip()
+    allowed_verdicts = {"STRONG", "OK", "LIMITED"}
+    if verdict not in allowed_verdicts:
+        # Fallback: if there is no candidate answer at all, LIMITED; otherwise OK
+        verdict = "LIMITED" if not cand_answer else "OK"
 
     try:
-        score = int(data.get("score", 3))
+        score = float(data.get("score", 0.0))
     except Exception:
-        score = 3
-    score = max(1, min(score, 5))
+        score = 0.0
+    # Clamp score into [0.0, 1.0]
+    score = max(0.0, min(1.0, score))
+    score_pct = int(round(score * 100))
 
-    verdict = (data.get("verdict") or "").strip().lower()
-    if verdict not in ("weak", "mixed", "strong"):
-        verdict = "mixed"
-
-    summary = _strip_code_and_json(data.get("summary") or data.get("explanation") or "")
-    strengths = data.get("strengths") or []
-    weaknesses = data.get("weaknesses") or []
-    followups = data.get("followups") or data.get("suggested_questions") or []
-
-    # Normalize list fields
-    def _norm_list(x):
-        if isinstance(x, list):
-            return [str(i).strip() for i in x if str(i).strip()]
-        if isinstance(x, str):
-            return [
-                s.lstrip("-• ").strip()
-                for s in x.splitlines()
-                if s.strip()
-            ]
-        return []
-
-    strengths = _norm_list(strengths)
-    weaknesses = _norm_list(weaknesses)
-    followups = _norm_list(followups)
+    exp_raw = (data.get("expected_answer") or data.get("raw") or "").strip()
+    explanation_raw = (data.get("explanation") or data.get("raw") or "").strip()
 
     return {
         "session_id": session_id,
         "question": question,
-        "dimension": dimension,
-        "raw_answer": raw_answer,
+        "expected_answer": _to_bullets(exp_raw, max_items=6),
+        "candidate_answer": cand_answer,
+        "verdict": verdict,          # STRONG / OK / LIMITED
         "score": score,
-        "verdict": verdict,
-        "summary": summary,
-        "strengths": strengths,
-        "weaknesses": weaknesses,
-        "followups": followups,
+        "score_pct": score_pct,
+        "explanation": _to_bullets(explanation_raw, max_items=3, max_len=160),
     }
+
+@app.post("/ai/questions")
+async def ai_questions(payload: Dict[str, Any] = Body(...)):
+    session_id = (payload or {}).get("session_id")
+    count = int((payload or {}).get("count", 5))
+    if not session_id:
+        raise HTTPException(400, "session_id required")
+
+    meeting = _sb_get_meeting(session_id)
+    resume = meeting.get("resume", "")
+    jd = meeting.get("jd", "")
+    turns = _recent_turns(session_id, 60)
+    convo = _turns_snippet(turns, 10)
+
+    prompt = f"""
+Return STRICT JSON with key: questions (array of {count} concise follow-up questions).
+Use JD and Resume as primary guidance; if transcript context exists, adapt to it; otherwise generate from JD/Resume only.
+Keep tone neutral and helpful.
+
+RESUME:
+{resume}
+
+JD:
+{jd}
+
+RECENT TRANSCRIPT:
+{convo if convo.strip() else "(none)"}
+""".strip()
+
+    data = _ollama_chat_json(prompt, temperature=0.6)
+    questions = data.get("questions")
+    if not isinstance(questions, list):
+        raw = (data.get("raw") or "").strip()
+        questions = [x.strip("-• ").strip() for x in raw.split("\n") if x.strip()]
+    questions = [q for q in questions if q][:count]
+    return {"session_id": session_id, "questions": questions}
 
 # ---------------------------------------------------------------------------
 # run (local)
