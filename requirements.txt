@@ -47,3 +47,6 @@ httpx
 
 # Google APIs (Calendar, OAuth credentials)
 google-api-python-client
+google-cloud-speech>=2.26.0
+google-auth>=2.0.0
+google-api-core>=2.0.0
