@@ -3193,6 +3193,31 @@ async def get_interview_detail(
 
 # ===================== INTERVIEW COPILOT =====================
 
+# High-level instructions for the copilot behavior
+COPILOT_SYSTEM_HINT = """
+You are an AI interview copilot helping a human interviewer evaluate a candidate.
+Be concise, structured, and practical. Avoid over-explaining theory.
+Always bias towards concrete, scenario-based questions that reveal real experience.
+""".strip()
+
+
+def _meet_context_for_session(session_id: str) -> dict:
+    """
+    Load meeting + transcript context for the AI copilot.
+    Returns: {meeting, turns, interviewer_name, candidate_name, jd, resume}
+    """
+    mtg = _sb_get_meeting(session_id) or {}
+    turns = _recent_turns(session_id, limit=2000)
+
+    return {
+        "meeting": mtg,
+        "turns": turns,
+        "interviewer_name": mtg.get("interviewer_name") or "Interviewer",
+        "candidate_name": mtg.get("candidate_name") or "Candidate",
+        "jd": mtg.get("jd") or "",
+        "resume": mtg.get("resume") or "",
+    }
+
 @app.post("/jobs/{job_id}/resumes/shortlist")
 async def shortlist_resumes(
     job_id: str,
@@ -3682,7 +3707,7 @@ async def ai_summary(payload: dict = Body(...)):
     """.strip()
 
 
-    data = _ollama_chat_json(prompt)
+    data = _ollama_json(prompt)
     coerced = _coerce_summary_payload(data)
 
     try:
@@ -3691,6 +3716,274 @@ async def ai_summary(payload: dict = Body(...)):
         print(f"[ai_summary] store report error: {e}")
 
     return {"session_id": session_id, **coerced}
+
+@app.post("/ai/question")
+async def ai_question(
+    payload: dict = Body(...),
+):
+    """
+    Generate the next interview question for a session.
+
+    Expected payload (flexible, no strict schema):
+    {
+      "session_id": "uuid",
+      "transcript_so_far": "...",   # optional – frontend can send or we load from DB
+      "focus": "backend" | "system design" | "communication" | ...
+    }
+    """
+    session_id = (payload or {}).get("session_id")
+    if not session_id:
+        raise HTTPException(400, "session_id required")
+
+    focus = (payload or {}).get("focus") or ""
+    transcript_override = (payload or {}).get("transcript_so_far")
+
+    ctx = _meet_context_for_session(session_id)
+    turns = ctx["turns"]
+
+    # If frontend passes transcript in payload, prefer that; else use DB transcript
+    if transcript_override:
+        pseudo_turns = _parse_transcript_to_turns(
+            transcript_override,
+            ctx["interviewer_name"],
+            ctx["candidate_name"],
+        )
+    else:
+        pseudo_turns = turns
+
+    convo = "\n".join(
+        f"{t.get('speaker_name') or t.get('speaker') or t.get('source')}: {t.get('text','')}"
+        for t in pseudo_turns
+    )
+
+    jd = ctx["jd"][:2000]
+    resume = ctx["resume"][:3000]
+
+    prompt = f"""
+{COPILOT_SYSTEM_HINT}
+
+You must return STRICT JSON ONLY with these keys:
+
+- "question": string (the question to ask next)
+- "dimension": string (one of: "problem_solving", "system_design", "backend", "frontend",
+                        "databases", "devops", "communication", "culture_fit", "general")
+- "reason": string (1–2 sentences explaining why this is a good next question)
+
+CONTEXT:
+- Focus hint from interviewer: "{focus}"
+- Job description (truncated):
+{jd}
+
+- Candidate resume (truncated):
+{resume}
+
+- Transcript so far:
+{convo}
+""".strip()
+
+    data = _ollama_json(prompt)
+
+    # Normalize response a bit for safety
+    question = (data.get("question") or "").strip()
+    dimension = (data.get("dimension") or "general").strip()
+    reason = _strip_code_and_json(data.get("reason") or data.get("rationale") or "")
+
+    if not question:
+        raise HTTPException(500, "LLM did not return a question")
+
+    return {
+        "session_id": session_id,
+        "question": question,
+        "dimension": dimension,
+        "reason": reason,
+    }
+
+@app.post("/ai/expected")
+async def ai_expected_answer(
+    payload: dict = Body(...),
+):
+    """
+    Given a question + session context, generate an 'ideal' / model answer.
+
+    Expected payload:
+    {
+      "session_id": "uuid",
+      "question": "What is ...?",
+      "dimension": "backend" | "system_design" | ...
+    }
+    """
+    session_id = (payload or {}).get("session_id")
+    question = (payload or {}).get("question")
+    dimension = (payload or {}).get("dimension") or "general"
+
+    if not session_id:
+        raise HTTPException(400, "session_id required")
+    if not question:
+        raise HTTPException(400, "question required")
+
+    ctx = _meet_context_for_session(session_id)
+    jd = ctx["jd"][:2000]
+    resume = ctx["resume"][:3000]
+
+    prompt = f"""
+{COPILOT_SYSTEM_HINT}
+
+You must return STRICT JSON ONLY with these keys:
+
+- "expected_answer": string (a compact but high-quality ideal answer, 3–8 sentences)
+- "bullets": array of strings (3–7 bullet points capturing key checkpoints)
+- "dimension": string (echo back the dimension you used)
+- "notes": string (short notes for the interviewer)
+
+Question:
+{question}
+
+Dimension: {dimension}
+
+Job description (truncated):
+{jd}
+
+Candidate resume (for seniority context, truncated):
+{resume}
+""".strip()
+
+    data = _ollama_json(prompt)
+
+    expected_answer = _strip_code_and_json(data.get("expected_answer") or data.get("answer") or "")
+    bullets = data.get("bullets") or data.get("checkpoints") or []
+    if isinstance(bullets, str):
+        bullets = [b.lstrip("-• ").strip() for b in bullets.splitlines() if b.strip()]
+
+    notes = _strip_code_and_json(data.get("notes") or "")
+    dimension_used = (data.get("dimension") or dimension).strip() or "general"
+
+    if not expected_answer:
+        # degrade gracefully: join bullets
+        expected_answer = "\n".join(f"- {b}" for b in bullets) or "Expected answer unavailable."
+
+    return {
+        "session_id": session_id,
+        "question": question,
+        "dimension": dimension_used,
+        "expected_answer": expected_answer,
+        "bullets": bullets,
+        "notes": notes,
+    }
+
+@app.post("/ai/validate")
+async def ai_validate_answer(
+    payload: dict = Body(...),
+):
+    """
+    Compare the candidate's answer to the expected answer and return a score + feedback.
+
+    Expected payload:
+    {
+      "session_id": "uuid",
+      "question": "What is ...?",
+      "raw_answer": "Candidate's transcript / notes",
+      "dimension": "backend" | "system_design" | ...,
+      "expected_answer": "...",      # optional – frontend can pass cached model answer
+      "bullets": [ "...", ... ]      # optional
+    }
+    """
+    session_id = (payload or {}).get("session_id")
+    question = (payload or {}).get("question")
+    raw_answer = (payload or {}).get("raw_answer")
+    dimension = (payload or {}).get("dimension") or "general"
+
+    if not session_id:
+        raise HTTPException(400, "session_id required")
+    if not question:
+        raise HTTPException(400, "question required")
+    if not raw_answer:
+        raise HTTPException(400, "raw_answer required")
+
+    expected_answer = (payload or {}).get("expected_answer") or ""
+    bullets = (payload or {}).get("bullets") or []
+
+    ctx = _meet_context_for_session(session_id)
+    jd = ctx["jd"][:1500]
+    resume = ctx["resume"][:2000]
+
+    prompt = f"""
+{COPILOT_SYSTEM_HINT}
+
+You must return STRICT JSON ONLY with these keys:
+
+- "score": integer from 1 to 5 (1=very poor, 3=ok, 5=excellent)
+- "verdict": string – one of: "weak", "mixed", "strong"
+- "summary": string – concise explanation (2–4 sentences) of how good the answer is
+- "strengths": array of strings – concrete positives in the answer
+- "weaknesses": array of strings – concrete gaps / mistakes
+- "followups": array of strings – smart follow-up questions the interviewer could ask
+
+Question:
+{question}
+
+Dimension: {dimension}
+
+Expected/model answer (if given by system, may be empty):
+{expected_answer}
+
+Key checkpoints (if any):
+{ json.dumps(bullets, ensure_ascii=False) }
+
+Candidate's raw answer:
+{raw_answer}
+
+Job description (truncated):
+{jd}
+
+Candidate resume (truncated):
+{resume}
+""".strip()
+
+    data = _ollama_json(prompt)
+
+    try:
+        score = int(data.get("score", 3))
+    except Exception:
+        score = 3
+    score = max(1, min(score, 5))
+
+    verdict = (data.get("verdict") or "").strip().lower()
+    if verdict not in ("weak", "mixed", "strong"):
+        verdict = "mixed"
+
+    summary = _strip_code_and_json(data.get("summary") or data.get("explanation") or "")
+    strengths = data.get("strengths") or []
+    weaknesses = data.get("weaknesses") or []
+    followups = data.get("followups") or data.get("suggested_questions") or []
+
+    # Normalize list fields
+    def _norm_list(x):
+        if isinstance(x, list):
+            return [str(i).strip() for i in x if str(i).strip()]
+        if isinstance(x, str):
+            return [
+                s.lstrip("-• ").strip()
+                for s in x.splitlines()
+                if s.strip()
+            ]
+        return []
+
+    strengths = _norm_list(strengths)
+    weaknesses = _norm_list(weaknesses)
+    followups = _norm_list(followups)
+
+    return {
+        "session_id": session_id,
+        "question": question,
+        "dimension": dimension,
+        "raw_answer": raw_answer,
+        "score": score,
+        "verdict": verdict,
+        "summary": summary,
+        "strengths": strengths,
+        "weaknesses": weaknesses,
+        "followups": followups,
+    }
 
 # ---------------------------------------------------------------------------
 # run (local)
