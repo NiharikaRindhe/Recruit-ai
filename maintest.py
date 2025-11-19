@@ -17,7 +17,26 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 import jwt
 import requests
-# imports (near the top)
+# --- MeetAI extra imports (add to existing imports) ---
+import asyncio
+import time
+import threading
+import queue
+from pathlib import Path
+from functools import lru_cache
+
+from fastapi import WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse  # you already import JSONResponse
+
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.openapi.utils import get_openapi
+
+# Google Cloud STT
+from google.cloud import speech
+from google.oauth2 import service_account
+
+# imports
 from supabase.client import ClientOptions
 import datetime
 from fastapi import Request
@@ -138,6 +157,8 @@ public_sb: Client = create_client(
 
 # Keep all your DB/storage code working without edits:
 supabase: Client = admin_sb
+# After your existing Supabase setup
+SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_SERVICE_KEY)
 
 INVITE_REDIRECT = os.getenv("INTERVIEWER_INVITE_REDIRECT")
 RESET_REDIRECT  = os.getenv("PASSWORD_RESET_REDIRECT")
@@ -782,6 +803,386 @@ def _first_row(resp):
     if isinstance(data, list):
         return data[0] if data else None
     return data
+
+# ─────────────────────────────────────────────
+# Google STT helpers (MeetAI)
+# ─────────────────────────────────────────────
+MAX_STREAM_SECONDS = 290  # keep from meetai.py
+
+def get_speech_client() -> speech.SpeechClient:
+    """
+    Uses GOOGLE_APPLICATION_CREDENTIALS if set, otherwise looks for service-account.json
+    in the backend folder, otherwise falls back to ADC.
+    """
+    env_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if env_path and os.path.exists(env_path):
+        creds = service_account.Credentials.from_service_account_file(env_path)
+        print(f"[startup] using credentials from env: {env_path}")
+        return speech.SpeechClient(credentials=creds)
+    local = Path(__file__).with_name("service-account.json")
+    if local.exists():
+        creds = service_account.Credentials.from_service_account_file(str(local))
+        print("[startup] using credentials from backend/service-account.json")
+        return speech.SpeechClient(credentials=creds)
+    print("[startup] using ADC")
+    return speech.SpeechClient()
+
+def make_recognition_config():
+    return speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+        sample_rate_hertz=16000,
+        language_code="en-US",
+        enable_automatic_punctuation=True,
+        use_enhanced=True,
+        model="default",
+    )
+
+def make_streaming_config():
+    return speech.StreamingRecognitionConfig(
+        config=make_recognition_config(),
+        interim_results=True,
+        single_utterance=False,
+    )
+# ─────────────────────────────────────────────
+# Meetings + transcript + ai_report helpers
+# ─────────────────────────────────────────────
+
+def _sb_get_meeting(session_id: str) -> dict:
+    if not SUPABASE_ENABLED:
+        return {}
+    try:
+        m = (
+            supabase
+            .table("meetings")
+            .select("*")
+            .eq("meeting_id", session_id)
+            .limit(1)
+            .execute()
+        )
+        data = getattr(m, "data", None)
+        if data:
+            return data[0]
+    except Exception as e:
+        print(f"[sb] get meeting error: {e}")
+    return {}
+
+def _sb_upd_meeting_transcript(session_id: str, new_transcript: str) -> None:
+    if not SUPABASE_ENABLED:
+        return
+    try:
+        supabase.table("meetings").update({"transcript": new_transcript}).eq(
+            "meeting_id", session_id
+        ).execute()
+    except Exception as e:
+        print(f"[sb] update transcript error: {e}")
+
+def _append_transcript_line(session_id: str, speaker_name: str, text: str) -> None:
+    mtg = _sb_get_meeting(session_id)
+    prev = mtg.get("transcript") or ""
+    line = f"{speaker_name}: {text}".strip()
+    new = (prev.rstrip() + "\n" + line) if prev.strip() else line
+    _sb_upd_meeting_transcript(session_id, new)
+
+def _sb_upsert_ai_report(session_id: str, report: dict) -> None:
+    """
+    Store AI summary json into meetings.ai_report (jsonb).
+    """
+    if not SUPABASE_ENABLED:
+        return
+    try:
+        safe_report = json.loads(json.dumps(report, ensure_ascii=False))
+    except Exception as e:
+        print(f"[sb] ai_report not JSON-serializable: {e}")
+        return
+    try:
+        supabase.table("meetings").update({"ai_report": safe_report}).eq(
+            "meeting_id", session_id
+        ).execute()
+    except Exception as e:
+        print(f"[sb] update meetings.ai_report error: {e}")
+
+# ─────────────────────────────────────────────
+# MeetAI LLM helper – reuse generate_jd_with_ollama
+# ─────────────────────────────────────────────
+
+def _ollama_chat_json(prompt: str, temperature: float = 0.2) -> dict:
+    """
+    Call your existing generate_jd_with_ollama() (which hits Ollama HTTP /generate)
+    and try to parse the response as JSON.
+    If parsing fails, return {"raw": text}.
+    """
+    # you can modify generate_jd_with_ollama to accept temperature if you want;
+    # for now we just ignore the temperature param.
+    text = generate_jd_with_ollama(prompt)
+    text = (text or "").strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        return {"raw": text}
+
+# ─────────────────────────────────────────────
+# Formatting helpers (bullets, etc.)
+# ─────────────────────────────────────────────
+_CODE_FENCE = re.compile(r"```.*?```", flags=re.S)
+
+
+def _strip_code_and_json(s: str) -> str:
+    if not s:
+        return ""
+    s = _CODE_FENCE.sub("", s)
+    s = s.replace("`", " ")
+    s = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", s)
+    s = re.sub(r"\*+", "", s)
+    s = re.sub(r"_+", "", s)
+    s = s.strip()
+    if s.startswith("{") and s.endswith("}"):
+        try:
+            obj = json.loads(s)
+            s = obj.get("explanation") or obj.get("expected_answer") or ""
+        except Exception:
+            s = ""
+    return s.strip()
+
+
+def _to_bullets(s: str, max_items: int = 6, max_len: int = 180) -> str:
+    s = _strip_code_and_json(s)
+    if not s:
+        return ""
+    parts = re.split(r"[\r\n]+|(?:^|[\s])[-–•·]\s+", s)
+    parts = [p.strip(" -–•\t\r\n") for p in parts if p and p.strip()]
+    if len(parts) <= 1:
+        parts = re.split(r"(?<=[.!?])\s+", s)
+    clean = []
+    for p in parts:
+        p = re.sub(r"\s+", " ", p).strip()
+        if not p:
+            continue
+        if len(p) > max_len:
+            p = p[: max_len - 1].rstrip() + "…"
+        clean.append(p)
+        if len(clean) >= max_items:
+            break
+    if not clean:
+        return ""
+    return "\n".join(f"• {p}" for p in clean)
+
+
+# Transcript → pseudo turns
+def _parse_transcript_to_turns(
+    transcript_text: str, interviewer_name: str, candidate_name: str
+) -> list[dict]:
+    if not (transcript_text or "").strip():
+        return []
+    out: list[dict] = []
+    lines = [ln.strip() for ln in transcript_text.splitlines() if ln.strip()]
+    for ln in lines:
+        if ":" in ln:
+            name, msg = ln.split(":", 1)
+            name = name.strip()
+            msg = msg.strip()
+        else:
+            if out:
+                out[-1]["text"] += " " + ln
+                continue
+            name, msg = "Unknown", ln
+
+        role = "unknown"
+        if interviewer_name and name.lower() == interviewer_name.lower():
+            role = "interviewer"
+        elif candidate_name and name.lower() == candidate_name.lower():
+            role = "candidate"
+        else:
+            if name.lower() in ("interviewer", "mic"):
+                role = "interviewer"
+            elif name.lower() in ("candidate", "tab"):
+                role = "candidate"
+
+        out.append(
+            {
+                "source": "mic"
+                if role == "interviewer"
+                else ("tab" if role == "candidate" else "unknown"),
+                "speaker": role,
+                "speaker_name": name,
+                "text": msg,
+                "is_final": True,
+            }
+        )
+    return out
+
+def google_stt_worker(
+    source: str,
+    session_id: Optional[str],
+    speaker: str,
+    speaker_name: str,
+    client: speech.SpeechClient,
+    audio_q: "queue.Queue[Optional[bytes]]",
+    loop: asyncio.AbstractEventLoop,
+    out_q: "asyncio.Queue[Optional[dict]]",
+):
+    def gen_with_config(stop_flag: dict):
+        yield speech.StreamingRecognizeRequest(
+            streaming_config=make_streaming_config()
+        )
+        while True:
+            chunk = audio_q.get()
+            if chunk is None:
+                stop_flag["stop"] = True
+                break
+            yield speech.StreamingRecognizeRequest(audio_content=chunk)
+
+    def audio_only(stop_flag: dict):
+        while True:
+            chunk = audio_q.get()
+            if chunk is None:
+                stop_flag["stop"] = True
+                break
+            yield speech.StreamingRecognizeRequest(audio_content=chunk)
+
+    while True:
+        stop_flag = {"stop": False}
+        start = time.time()
+        try:
+            try:
+                responses = client.streaming_recognize(
+                    requests=gen_with_config(stop_flag)
+                )
+            except TypeError:
+                responses = client.streaming_recognize(
+                    make_streaming_config(), audio_only(stop_flag)
+                )
+
+            for resp in responses:
+                if not resp.results:
+                    if time.time() - start > MAX_STREAM_SECONDS:
+                        break
+                    continue
+                for result in resp.results:
+                    text = result.alternatives[0].transcript
+                    is_final = result.is_final
+
+                    asyncio.run_coroutine_threadsafe(
+                        out_q.put(
+                            {
+                                "source": source,
+                                "speaker": speaker,
+                                "speaker_name": speaker_name,
+                                "text": text,
+                                "final": is_final,
+                            }
+                        ),
+                        loop,
+                    )
+
+                    if (
+                        SUPABASE_ENABLED
+                        and session_id
+                        and is_final
+                        and text.strip()
+                    ):
+                        try:
+                            _append_transcript_line(
+                                session_id, speaker_name, text.strip()
+                            )
+                        except Exception as e:
+                            print(f"[stt:{source}] transcript append error: {e}")
+
+                if time.time() - start > MAX_STREAM_SECONDS:
+                    print("[stt] rotating stream to avoid 305s limit…")
+                    break
+
+        except Exception as e:
+            if "Audio Timeout Error" in str(e):
+                print("[stt] timeout; restarting stream…")
+                continue
+        finally:
+            if stop_flag["stop"]:
+                break
+
+    asyncio.run_coroutine_threadsafe(out_q.put(None), loop)
+
+
+async def result_sender(
+    websocket: WebSocket, out_q: "asyncio.Queue[Optional[dict]]", source: str
+):
+    while True:
+        item = await out_q.get()
+        if item is None:
+            break
+        try:
+            await websocket.send_text(json.dumps(item))
+        except Exception as e:
+            print(f"[ws:{source}] send error: {e}")
+            break
+
+def _recent_turns(session_id: str, limit: int = 2000) -> list[dict]:
+    """
+    Load the meeting transcript from Supabase and convert it into
+    pseudo-turns (speaker + text) using _parse_transcript_to_turns.
+    The 'limit' is a soft cap on number of characters; you can
+    adjust if you want.
+    """
+    mtg = _sb_get_meeting(session_id)
+    if not mtg:
+        return []
+
+    transcript = mtg.get("transcript") or ""
+    interviewer_name = mtg.get("interviewer_name") or ""
+    candidate_name = mtg.get("candidate_name") or ""
+
+    # If transcript is very long, truncate from the end (most recent lines)
+    if len(transcript) > limit:
+        # keep last `limit` chars
+        transcript = transcript[-limit:]
+
+    return _parse_transcript_to_turns(
+        transcript_text=transcript,
+        interviewer_name=interviewer_name,
+        candidate_name=candidate_name,
+    )
+
+def _coerce_summary_payload(data: dict) -> dict:
+    """
+    Make sure the AI summary payload always has a stable shape for the frontend
+    and for storage in meetings.ai_report.
+    Expected shape:
+      {
+        "overall_recommendation": str,
+        "summary": str,
+        "strengths": [str],
+        "weaknesses": [str],
+        "concerns": [str],
+        "suggested_questions": [str],
+        "final_comment": str
+      }
+    Anything missing or of the wrong type is replaced with a safe default.
+    """
+    if not isinstance(data, dict):
+        data = {}
+
+    def _as_list(x) -> list[str]:
+        if isinstance(x, list):
+            return [str(i).strip() for i in x if str(i).strip()]
+        if isinstance(x, str) and x.strip():
+            # split bullet-y text into lines
+            parts = re.split(r"[\r\n]+|(?:^|[\s])[-–•·]\s+", x)
+            return [p.strip(" -–•·\t\r\n") for p in parts if p.strip()]
+        return []
+
+    def _as_str(x) -> str:
+        if isinstance(x, str):
+            return x.strip()
+        return ""
+
+    return {
+        "overall_recommendation": _as_str(data.get("overall_recommendation")),
+        "summary": _as_str(data.get("summary")),
+        "strengths": _as_list(data.get("strengths")),
+        "weaknesses": _as_list(data.get("weaknesses")),
+        "concerns": _as_list(data.get("concerns")),
+        "suggested_questions": _as_list(data.get("suggested_questions")),
+        "final_comment": _as_str(data.get("final_comment")),
+    }
 
 # ---------------------------------------------------------------------------
 # routes (YOUR ORIGINAL ROUTES — UNCHANGED)
@@ -2792,303 +3193,6 @@ async def get_interview_detail(
 
 # ===================== INTERVIEW COPILOT =====================
 
-@app.get("/copilot/interviews/{interview_id}/bootstrap")
-async def copilot_bootstrap(
-    interview_id: str,
-    current_user: UserIdentity = Depends(get_current_user),
-):
-    """
-    Prepare full context for a live interview:
-    - Candidate summary
-    - JD summary
-    - Suggested interview flow
-    - Rubric
-    - Starter questions
-    """
-    ctx = _get_interview_context(interview_id, current_user)
-    job = ctx["job"]
-    resume = ctx["resume"]
-    meta = ctx["meta"]
-    must = ctx["must"]
-    nice = ctx["nice"]
-
-    job_role = job.get("role") or "Interview"
-    jd_text = job.get("jd_text") or ""
-    candidate_name = (
-        resume.get("full_name")
-        or resume.get("candidate_name")
-        or resume.get("email")
-    )
-    candidate_email = resume.get("email")
-
-    prompt = f"""
-You are an AI interview copilot assisting a human interviewer.
-
-Use the following context to prepare for the interview.
-
-JOB:
-- Title: {job_role}
-- Location: {job.get('location')}
-- Employment type: {job.get('employment_type')}
-- Work mode: {job.get('work_mode')}
-- Must-have skills: {', '.join(must or [])}
-- Nice-to-have skills: {', '.join(nice or [])}
-
-JOB DESCRIPTION:
-{jd_text[:4000]}
-
-CANDIDATE (from resume):
-- Name: {candidate_name}
-- Email: {candidate_email}
-- Location: {resume.get('location')}
-- Existing AI summary (if any): {(resume.get('ai_summary') or '')[:1500]}
-
-STRUCTURED RESUME FIELDS (truncated JSON):
-skills: {(json.dumps(resume.get('skills') or {}, ensure_ascii=False))[:1500]}
-experience: {(json.dumps((resume.get('experience') or [])[:5], ensure_ascii=False))[:2000]}
-education: {(json.dumps((resume.get('education') or [])[:3], ensure_ascii=False))[:800]}
-
-MATCH METRICS:
-- jd_match_score: {resume.get('jd_match_score')}
-- skill_match_score: {resume.get('skill_match_score')}
-- experience_match_score: {resume.get('experience_match_score')}
-- total_experience_years (if known): {meta.get('total_experience_years')}
-
-Return ONLY JSON with these exact top-level keys:
-- candidate_summary: string (Markdown, 3–5 bullet points with the strongest signals)
-- jd_summary: string (Markdown, 3–5 bullet points explaining what this role really needs)
-- suggested_flow: array of objects with keys:
-    - section: string (e.g. "Intro", "Deep dive in backend APIs")
-    - goal: string (what the interviewer should achieve in this section)
-    - minutes: integer (approx. time in minutes)
-- rubric: object mapping competency name to an object:
-    - what_good_looks_like: string
-    - scale: string describing 1–5 expectations
-- starter_questions: array of ~8 concrete, actionable interview questions tailored
-  to this role and candidate.
-
-Do not include any other keys.
-Do not include comments or extra text outside the JSON.
-    """.strip()
-
-    data = _ollama_json(prompt)
-
-    return {
-        "interview_id": interview_id,
-        "job": {
-            "role": job_role,
-            "location": job.get("location"),
-            "employment_type": job.get("employment_type"),
-            "work_mode": job.get("work_mode"),
-            "must_have": must,
-            "nice_to_have": nice,
-        },
-        "candidate": {
-            "name": candidate_name,
-            "email": candidate_email,
-            "location": resume.get("location"),
-        },
-        "copilot": data,
-    }
-
-
-@app.post("/copilot/interviews/{interview_id}/suggest-question")
-async def copilot_suggest_question(
-    interview_id: str,
-    body: CopilotQuestionIn,
-    current_user: UserIdentity = Depends(get_current_user),
-):
-    """
-    Suggest the next question to ask, given:
-    - JD + resume context
-    - Optional transcript so far
-    - Optional focus area
-    """
-    ctx = _get_interview_context(interview_id, current_user)
-    job = ctx["job"]
-    resume = ctx["resume"]
-    must = ctx["must"]
-    nice = ctx["nice"]
-
-    job_role = job.get("role") or "Interview"
-    jd_text = job.get("jd_text") or ""
-    candidate_name = (
-        resume.get("full_name")
-        or resume.get("candidate_name")
-        or resume.get("email")
-    )
-
-    transcript = (body.transcript_so_far or "").strip()
-    focus = (body.focus or "").strip()
-
-    prompt = f"""
-You are an AI interview copilot helping a human interviewer decide the NEXT question.
-
-CONTEXT:
-- Role: {job_role}
-- Must-have skills: {', '.join(must or [])}
-- Nice-to-have skills: {', '.join(nice or [])}
-
-JOB DESCRIPTION (truncated):
-{jd_text[:2000]}
-
-CANDIDATE:
-- Name: {candidate_name}
-- Email: {resume.get('email')}
-- Location: {resume.get('location')}
-
-STRUCTURED RESUME (truncated JSON):
-skills: {(json.dumps(resume.get('skills') or {}, ensure_ascii=False))[:1200]}
-experience: {(json.dumps((resume.get('experience') or [])[:5], ensure_ascii=False))[:1800]}
-
-TRANSCRIPT SO FAR:
-{transcript if transcript else "(no transcript provided)"}
-
-FOCUS AREA (if any):
-{focus if focus else "(none specified)"}
-
-Return ONLY JSON with these exact top-level keys:
-- question: string, the next question to ask (clear, concise, and specific)
-- type: string, one of ["behavioral", "technical", "system_design", "communication", "culture"]
-- rationale: short string explaining why this is a good next question
-- follow_ups: array of 2–4 short follow-up questions the interviewer can use
-
-No extra keys and no extra text outside the JSON.
-    """.strip()
-
-    data = _ollama_json(prompt)
-    return {
-        "interview_id": interview_id,
-        "suggestion": data,
-    }
-
-
-@app.post("/copilot/interviews/{interview_id}/summarize-answer")
-async def copilot_summarize_answer(
-    interview_id: str,
-    body: CopilotAnswerIn,
-    current_user: UserIdentity = Depends(get_current_user),
-):
-    """
-    Summarize a single answer into:
-    - Bullet notes
-    - Score hints per dimension
-    - Risk flags & suggested follow-ups
-    """
-    ctx = _get_interview_context(interview_id, current_user)
-    job = ctx["job"]
-    resume = ctx["resume"]
-
-    job_role = job.get("role") or "Interview"
-    dim = (body.dimension or "").strip()
-
-    prompt = f"""
-You are an AI note-taking assistant for a technical interview.
-
-JOB ROLE: {job_role}
-
-CANDIDATE:
-- Name: {resume.get('full_name') or resume.get('email')}
-- Email: {resume.get('email')}
-
-QUESTION ASKED:
-{body.question}
-
-CANDIDATE ANSWER (verbatim):
-{body.raw_answer}
-
-DIMENSION (if provided) indicates which competency this question targets, e.g.
-"problem_solving", "system_design", "communication", "culture", "leadership".
-Dimension provided: {dim if dim else "(none specified, infer from the content if possible)"}
-
-Return ONLY JSON with these exact top-level keys:
-- notes_markdown: string (3–8 bullet points in Markdown capturing key facts, signals, and examples)
-- scores: object mapping dimension name (e.g. "problem_solving") to an integer 1–5
-- risk_flags: array of short strings describing any concerns or red flags; empty array if none
-- follow_up_suggestions: array of 2–4 follow-up questions the interviewer could ask next
-
-No extra keys, no comments, and no text outside the JSON.
-    """.strip()
-
-    data = _ollama_json(prompt)
-    return {
-        "interview_id": interview_id,
-        "analysis": data,
-    }
-
-
-@app.post("/copilot/interviews/{interview_id}/final-report")
-async def copilot_final_report(
-    interview_id: str,
-    body: CopilotFinalIn,
-    current_user: UserIdentity = Depends(get_current_user),
-):
-    """
-    Generate a concise final report after the interview:
-    - Overall summary
-    - Strengths / weaknesses
-    - Risk flags
-    - Recommended decision
-    """
-    ctx = _get_interview_context(interview_id, current_user)
-    job = ctx["job"]
-    resume = ctx["resume"]
-
-    job_role = job.get("role") or "Interview"
-    notes = (body.notes or "").strip()
-    decision = (body.decision or "").strip()
-    ratings = body.ratings or {}
-
-    prompt = f"""
-You are an AI assistant helping an interviewer write a final evaluation.
-
-JOB:
-- Role: {job_role}
-- Location: {job.get('location')}
-- Employment type: {job.get('employment_type')}
-- Work mode: {job.get('work_mode')}
-
-CANDIDATE:
-- Name: {resume.get('full_name') or resume.get('email')}
-- Email: {resume.get('email')}
-- Location: {resume.get('location')}
-
-MATCH METRICS:
-- jd_match_score: {resume.get('jd_match_score')}
-- skill_match_score: {resume.get('skill_match_score')}
-- experience_match_score: {resume.get('experience_match_score')}
-
-EXISTING AI RESUME SUMMARY (if any):
-{(resume.get('ai_summary') or '')[:1500]}
-
-INTERVIEWER NOTES (raw text, may be messy):
-{notes if notes else "(no extra notes provided)"}
-
-INTERVIEWER DECISION (if provided):
-{decision if decision else "(no explicit decision yet)"}
-
-INTERVIEWER RATINGS (JSON, if provided):
-{json.dumps(ratings, ensure_ascii=False)}
-
-Return ONLY JSON with these exact top-level keys:
-- summary_markdown: short Markdown summary (max ~250 words) with clear sections:
-    - "Overall impression"
-    - "Strengths"
-    - "Concerns"
-- recommended_decision: one of ["strong_hire", "hire", "no_hire", "unsure"]
-- justification: 2–4 bullet points explaining the recommendation
-- coaching_for_next_round: 2–5 bullet points suggesting what next-round interviewers should focus on
-
-No extra keys and no text outside the JSON.
-    """.strip()
-
-    data = _ollama_json(prompt)
-
-    return {
-        "interview_id": interview_id,
-        "final_report": data,
-    }
-
 @app.post("/jobs/{job_id}/resumes/shortlist")
 async def shortlist_resumes(
     job_id: str,
@@ -3378,6 +3482,216 @@ async def update_interview_status(interview_id: str, body: InterviewStatusIn,
     if not row:
         raise HTTPException(404, "Interview not found")
     return {"interview_id": interview_id, "status": body.status}
+
+# ─────────────────────────────────────────────
+# MeetAI session endpoints (reuse same DB)
+# ─────────────────────────────────────────────
+
+@app.post("/session/start")
+async def meet_session_start(payload: dict):
+    meeting_id = payload.get("meeting_id")
+    if not meeting_id:
+        raise HTTPException(400, "meeting_id required")
+    if not SUPABASE_ENABLED:
+        raise HTTPException(
+            500,
+            "Supabase not configured on server (.env missing SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY)",
+        )
+
+    row: dict = {"meeting_id": meeting_id}
+    for k in ("jd", "resume", "interviewer_name", "candidate_name"):
+        v = payload.get(k)
+        if v is not None:
+            row[k] = v
+
+    supabase.table("meetings").upsert(row, on_conflict="meeting_id").execute()
+    return {"session_id": meeting_id}
+
+# ADD NEAR OTHER IMPORTS
+from fastapi import Body
+
+# ...
+
+@app.post("/meet/session/bootstrap")
+async def meet_session_bootstrap(
+    payload: Dict[str, str] = Body(...),
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    """
+    Create / upsert a MeetAI 'session' (meetings row) using ONLY interview_id.
+    This means the interviewer never has to type JD, resume text, candidate name, etc.
+    
+    Frontend will:
+      1) Call this endpoint with { "interview_id": "..." }
+      2) Receive: { session_id, meeting_id, candidate_name, interviewer_name, jd, resume }
+      3) Use session_id/meeting_id when connecting to MeetAI WebSocket or /ai endpoints.
+    """
+    interview_id = (payload or {}).get("interview_id")
+    if not interview_id:
+        raise HTTPException(400, "interview_id required")
+
+    # Use your existing helper: verifies interviewer owns this interview
+    ctx = _get_interview_context(interview_id, current_user)
+    job = ctx["job"]
+    resume = ctx["resume"]
+    interviewer = ctx["interviewer"]
+
+    # Build the values MeetAI expects
+    meeting_id = interview_id  # <-- use interview_id as session/meeting id
+    jd_text = job.get("jd_text") or ""
+    resume_text = resume.get("raw_text") or ""
+    candidate_name = (
+        resume.get("full_name")
+        or resume.get("candidate_name")
+        or resume.get("email")
+        or "Candidate"
+    )
+    interviewer_name = interviewer.get("name") or interviewer.get("email") or "Interviewer"
+
+    # We are reusing the same Supabase client as everywhere else
+    # Upsert into 'meetings' table used by MeetAI:
+    row = {
+        "meeting_id": meeting_id,
+        "jd": jd_text,
+        "resume": resume_text,
+        "interviewer_name": interviewer_name,
+        "candidate_name": candidate_name,
+    }
+
+    # NOTE: uses same table/shape as meetai.py's start_session()
+    supabase.table("meetings").upsert(row, on_conflict="meeting_id").execute()
+
+    return {
+        "session_id": meeting_id,
+        "meeting_id": meeting_id,
+        "candidate_name": candidate_name,
+        "interviewer_name": interviewer_name,
+        "jd": jd_text,
+        "resume": resume_text,
+    }
+
+@app.get("/session/{session_id}/turns")
+async def meet_get_turns(session_id: str):
+    mtg = _sb_get_meeting(session_id)
+    pseudo = _parse_transcript_to_turns(
+        mtg.get("transcript") or "",
+        mtg.get("interviewer_name") or "",
+        mtg.get("candidate_name") or "",
+    )
+    return {"session_id": session_id, "turns": pseudo}
+
+# ─────────────────────────────────────────────
+# WebSocket STT
+# ─────────────────────────────────────────────
+@app.websocket("/ws/{source}")
+async def websocket_stt(websocket: WebSocket, source: str):
+    if source not in ("mic", "tab"):
+        await websocket.close(code=1008)
+        return
+    await websocket.accept()
+    qp = websocket.query_params
+    session_id = qp.get("session_id")
+    speaker = qp.get("speaker") or ("interviewer" if source == "mic" else "candidate")
+    speaker_name = qp.get("speaker_name") or speaker
+
+    print(
+        f"[ws:{source}] connected (session={session_id}, speaker={speaker}, name={speaker_name})"
+    )
+
+    try:
+        stt_client = get_speech_client()
+    except Exception as e:
+        print(f"[stt-init] error: {e}")
+        await websocket.close()
+        return
+
+    audio_q: "queue.Queue[Optional[bytes]]" = queue.Queue()
+    out_q: "asyncio.Queue[Optional[dict]]" = asyncio.Queue()
+
+    worker = threading.Thread(
+        target=google_stt_worker,
+        args=(
+            source,
+            session_id,
+            speaker,
+            speaker_name,
+            stt_client,
+            audio_q,
+            asyncio.get_running_loop(),
+            out_q,
+        ),
+        daemon=True,
+    )
+    worker.start()
+
+    sender_task = asyncio.create_task(result_sender(websocket, out_q, source))
+
+    try:
+        while True:
+            try:
+                msg = await websocket.receive()
+            except WebSocketDisconnect:
+                print(f"[ws:{source}] disconnected")
+                break
+            except RuntimeError as e:
+                if "disconnect message has been received" in str(e).lower():
+                    print(f"[ws:{source}] disconnect acknowledged")
+                    break
+                raise
+            if msg.get("bytes") is not None:
+                audio_q.put(msg["bytes"])  # PCM16 bytes
+    finally:
+        audio_q.put(None)
+        try:
+            await asyncio.wait_for(sender_task, timeout=2)
+        except asyncio.TimeoutError:
+            sender_task.cancel()
+        print(f"[ws:{source}] done")
+
+@app.post("/ai/summary")
+async def ai_summary(payload: dict = Body(...)):
+    session_id = (payload or {}).get("session_id")
+    if not session_id:
+        raise HTTPException(400, "session_id required")
+    meeting = _sb_get_meeting(session_id)
+    turns = _recent_turns(session_id, limit=2000)
+    resume = meeting.get("resume", "")
+    jd = meeting.get("jd", "")
+
+    lines = [
+        f"{(t.get('speaker_name') or t.get('speaker') or t.get('source'))}: {t.get('text','')}"
+        for t in turns
+    ]
+    convo = "\n".join(lines)
+
+    # ... same long prompt as in meetai.py ...
+    prompt = f"""
+    You are helping a recruiter. Return STRICT JSON ONLY with exactly these keys:
+    overall_recommendation, summary, strengths, weaknesses, concerns,
+    suggested_questions, final_comment.
+
+    Each key must be present. strengths/weaknesses/concerns/suggested_questions
+    should be arrays of short bullet strings. Do NOT include any extra keys.
+
+    CONTEXT:
+    - Job description (if provided): {jd[:2000]}
+    - Candidate resume (if provided): {resume[:3000]}
+
+    FULL TRANSCRIPT:
+    {convo}
+    """.strip()
+
+
+    data = _ollama_chat_json(prompt)
+    coerced = _coerce_summary_payload(data)
+
+    try:
+        _sb_upsert_ai_report(session_id, coerced)
+    except Exception as e:
+        print(f"[ai_summary] store report error: {e}")
+
+    return {"session_id": session_id, **coerced}
+
 # ---------------------------------------------------------------------------
 # run (local)
 # ---------------------------------------------------------------------------
