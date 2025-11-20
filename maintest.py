@@ -297,6 +297,30 @@ class CopilotFinalIn(BaseModel):
         description="Optional numeric ratings per competency, e.g. {'problem_solving': 4, 'communication': 3}"
     )
 
+# -------- Interview feedback & recruiter decision models --------
+
+from typing import Literal  # you already imported this above, so skip if present
+
+class InterviewFeedbackIn(BaseModel):
+    # Radio buttons from interviewer UI
+    overall_recommendation: Literal["STRONG_HIRE", "HIRE", "UNSURE", "DO_NOT_HIRE"]
+    skills_level: Literal["LOW", "MEDIUM", "HIGH"]
+    communication_level: Literal["NEEDS_WORK", "OKAY", "STRONG"]
+    jd_fit_level: Literal["PERFECT", "GOOD", "PARTIAL", "UNCERTAIN"]
+
+    # Checkboxes: will map your UI keys → booleans
+    # e.g. { strong_tech_depth: true, collab_mindset: true, needs_clarity: false, limited_data: false }
+    flags: Dict[str, bool] = Field(default_factory=dict)
+
+    # Free-text comment from interviewer
+    comment: Optional[str] = None
+
+
+class RecruiterDecisionIn(BaseModel):
+    # What recruiter decides for this interview
+    status: Literal["REVIEW", "HIRED", "REJECTED", "SELECTED"]
+    note: Optional[str] = None  # recruiter internal note
+
 # ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------
@@ -1267,7 +1291,76 @@ def _coerce_summary_payload(model_out: Any) -> dict:
     out["interview_summary"] = _coerce_text(model_out.get("interview_summary"))
 
     return out
+# ─────────────────────────────────────────────
+# Interview feedback → numeric scores (0–10)
+# ─────────────────────────────────────────────
 
+_OVERALL_MAP = {
+    "STRONG_HIRE": 10,
+    "HIRE": 8,
+    "UNSURE": 5,
+    "DO_NOT_HIRE": 2,
+}
+
+_SKILLS_MAP = {
+    "LOW": 3,
+    "MEDIUM": 6,
+    "HIGH": 9,
+}
+
+_COMM_MAP = {
+    "NEEDS_WORK": 3,
+    "OKAY": 6,
+    "STRONG": 9,
+}
+
+_JD_FIT_MAP = {
+    "PERFECT": 10,
+    "GOOD": 8,
+    "PARTIAL": 5,
+    "UNCERTAIN": 3,
+}
+
+
+def compute_feedback_scores(body: InterviewFeedbackIn) -> Dict[str, int]:
+    """Map radio selections to consistent 0–10 scores."""
+    skills = _SKILLS_MAP[body.skills_level]
+    comm = _COMM_MAP[body.communication_level]
+    jd   = _JD_FIT_MAP[body.jd_fit_level]
+
+    # base from 3 dimensions
+    base_overall = round((skills + comm + jd) / 3)
+
+    # interviewer recommendation nudges overall
+    rec = _OVERALL_MAP[body.overall_recommendation]
+    overall = round(0.7 * base_overall + 0.3 * rec)
+
+    # clamp
+    overall = max(0, min(10, overall))
+
+    return {
+        "skills_score": skills,
+        "communication_score": comm,
+        "jd_fit_score": jd,
+        "overall_score": overall,
+    }
+
+def final_candidate_score(
+    jd_match: Optional[float],
+    feedback_overall: Optional[int],
+    ai_overall: Optional[int],
+) -> float:
+    """
+    Combine JD match (0–100) + feedback (0–10) + AI overall (0–10)
+    into one final score on 0–10 for ranking.
+    """
+    jd = (jd_match or 0.0) / 10.0  # normalize 0–10
+    fb = float(feedback_overall or 0)
+    ai = float(ai_overall or 0)
+
+    # weights: tweak as you like (must sum to 1)
+    score = 0.4 * jd + 0.4 * fb + 0.2 * ai
+    return round(score, 2)
 
 # ─────────────────────────────────────────────
 # Candidate answer extraction (transcript-only)
@@ -1637,6 +1730,101 @@ async def list_recruiter_interviews_today(
         "date": day.isoformat(),
         "count": len(items),
         "interviews": items,
+    }
+
+@app.get("/recruiter/interviews/{interview_id}/overview")
+async def recruiter_interview_overview(
+    interview_id: str,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    """
+    Full 360° view for recruiter:
+    - interview basic info
+    - resume + JD scores
+    - interviewer feedback
+    - transcript + AI report (from meetings)
+    - recruiter note
+    """
+    # 1) Load interview
+    interview = _first_row(
+        supabase.table("interviews")
+        .select("*")
+        .eq("interview_id", interview_id)
+        .limit(1)
+        .execute()
+    )
+    if not interview:
+        raise HTTPException(404, "Interview not found")
+
+    # 2) Ensure recruiter owns this job
+    job = _get_job_owned(interview["job_id"], current_user)  # also returns the job row
+
+    # 3) Resume
+    resume = _first_row(
+        supabase.table("resumes")
+        .select(
+            "resume_id, candidate_id, full_name, email, phone, location, "
+            "ai_summary, jd_match_score, skill_match_score, experience_match_score, "
+            "education_match_score, raw_text, skills, experience, education, projects, certifications"
+        )
+        .eq("resume_id", interview["resume_id"])
+        .limit(1)
+        .execute()
+    )
+
+    # 4) Candidate profile (optional)
+    candidate = None
+    if resume and resume.get("candidate_id"):
+        candidate = _first_row(
+            supabase.table("candidates")
+            .select("candidate_id, first_name, last_name, full_name, email, phone, location, links")
+            .eq("candidate_id", resume["candidate_id"])
+            .limit(1)
+            .execute()
+        )
+
+    # 5) Interviewer feedback
+    feedback = _first_row(
+        supabase.table("interview_feedback")
+        .select("*")
+        .eq("interview_id", interview_id)
+        .limit(1)
+        .execute()
+    )
+
+    # 6) Transcript + AI report (meetings table uses meeting_id == interview_id)
+    meeting = _first_row(
+        supabase.table("meetings")
+        .select("transcript, ai_report")
+        .eq("meeting_id", interview_id)
+        .limit(1)
+        .execute()
+    ) or {}
+
+    return {
+        "interview": {
+            "interview_id": interview["interview_id"],
+            "status": interview.get("status"),
+            "start_at": interview.get("start_at"),
+            "end_at": interview.get("end_at"),
+            "meet_link": interview.get("google_meet_link"),
+            "calendar_link": interview.get("google_html_link"),
+            "feedback_overall_score": interview.get("feedback_overall_score"),
+            "recruiter_note": interview.get("recruiter_note"),
+        },
+        "job": {
+            "job_id": job["job_id"],
+            "role": job.get("role"),
+            "location": job.get("location"),
+            "employment_type": job.get("employment_type"),
+            "work_mode": job.get("work_mode"),
+            "jd_text": job.get("jd_text"),
+        },
+        "candidate": candidate,
+        "resume": resume,
+        "feedback": feedback,
+        "transcript": meeting.get("transcript"),
+        "ai_report": meeting.get("ai_report"),
     }
 
 # ---------- company ----------
@@ -2507,6 +2695,133 @@ async def ranked(job_id: str, limit: int = Query(50, ge=1, le=200), current_user
         .data
     )
     return {"job_id": job_id, "count": len(rows), "rows": rows}
+
+@app.get("/recruiter/jobs/{job_id}/candidates-ranked")
+async def recruiter_candidates_ranked(
+    job_id: str,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    """
+    For a given job, return candidates ranked by combined score:
+    JD match + interviewer feedback + AI report.
+    """
+    # Ensure this recruiter owns the job
+    job = _get_job_owned(job_id, current_user)
+
+    # 1) All resumes for this job
+    resumes = (
+        supabase.table("resumes")
+        .select(
+            "resume_id, candidate_id, full_name, email, jd_match_score, "
+            "skill_match_score, experience_match_score"
+        )
+        .eq("job_id", job_id)
+        .execute()
+        .data
+        or []
+    )
+    if not resumes:
+        return {"job_id": job_id, "role": job.get("role"), "candidates": []}
+
+    resume_ids = [r["resume_id"] for r in resumes]
+
+    # 2) Interviews for those resumes
+    interviews = (
+        supabase.table("interviews")
+        .select("interview_id, resume_id, status, feedback_overall_score")
+        .in_("resume_id", resume_ids)
+        .execute()
+        .data
+        or []
+    )
+    interviews_by_resume = {i["resume_id"]: i for i in interviews}
+    interview_ids = [i["interview_id"] for i in interviews]
+
+    # 3) Feedback rows
+    feedback_rows = (
+        supabase.table("interview_feedback")
+        .select("interview_id, overall_score")
+        .in_("interview_id", interview_ids)
+        .execute()
+        .data
+        or []
+    )
+    fb_by_interview = {f["interview_id"]: f for f in feedback_rows}
+
+    # 4) AI reports
+    meetings = (
+        supabase.table("meetings")
+        .select("meeting_id, ai_report")
+        .in_("meeting_id", interview_ids)
+        .execute()
+        .data
+        or []
+    )
+    ai_by_meeting = {m["meeting_id"]: m for m in meetings}
+
+    items = []
+    for r in resumes:
+        it = interviews_by_resume.get(r["resume_id"])
+        if not it:
+            # No interview yet; still include but score will be low
+            final_score_val = final_candidate_score(r.get("jd_match_score"), None, None)
+            items.append(
+                {
+                    "resume_id": r["resume_id"],
+                    "candidate_id": r.get("candidate_id"),
+                    "full_name": r.get("full_name"),
+                    "email": r.get("email"),
+                    "jd_match_score": r.get("jd_match_score"),
+                    "feedback_overall_score": None,
+                    "ai_overall_score": None,
+                    "interview_id": None,
+                    "interview_status": None,
+                    "final_score": final_score_val,
+                }
+            )
+            continue
+
+        fb_row = fb_by_interview.get(it["interview_id"])
+        feedback_overall = (
+            (fb_row or {}).get("overall_score")
+            or it.get("feedback_overall_score")
+        )
+
+        mt = ai_by_meeting.get(it["interview_id"])
+        ai_overall = None
+        if mt and mt.get("ai_report"):
+            ai_overall = (mt["ai_report"].get("analytics") or {}).get("overall_score")
+
+        final_score_val = final_candidate_score(
+            jd_match=r.get("jd_match_score"),
+            feedback_overall=feedback_overall,
+            ai_overall=ai_overall,
+        )
+
+        items.append(
+            {
+                "resume_id": r["resume_id"],
+                "candidate_id": r.get("candidate_id"),
+                "full_name": r.get("full_name"),
+                "email": r.get("email"),
+                "jd_match_score": r.get("jd_match_score"),
+                "feedback_overall_score": feedback_overall,
+                "ai_overall_score": ai_overall,
+                "interview_id": it["interview_id"],
+                "interview_status": it.get("status"),
+                "final_score": final_score_val,
+            }
+        )
+
+    # Sort best → worst
+    items.sort(key=lambda x: x["final_score"], reverse=True)
+
+    return {
+        "job_id": job_id,
+        "role": job.get("role"),
+        "count": len(items),
+        "candidates": items,
+    }
 
 @app.post("/jobs/{job_id}/rescore_existing")
 async def rescore_existing(job_id: str, current_user: UserIdentity = Depends(get_current_user)):
@@ -3388,6 +3703,62 @@ def _meet_context_for_session(session_id: str) -> dict:
         "resume": mtg.get("resume") or "",
     }
 
+@app.post("/interviews/{interview_id}/feedback")
+async def submit_interview_feedback(
+    interview_id: str,
+    body: InterviewFeedbackIn,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    """
+    Called by the interviewer after the interview.
+    Stores raw choices + numeric scores in interview_feedback,
+    and updates interviews.feedback_overall_score for ranking.
+    """
+    # 1) Ensure this auth user is the assigned interviewer
+    ctx = _get_interview_context(interview_id, current_user)
+    interviewer = ctx["interviewer"]
+    interviewer_id = interviewer["interviewer_id"]
+
+    # 2) Compute scores 0–10
+    scores = compute_feedback_scores(body)
+
+    # 3) Upsert feedback row
+    row = {
+        "interview_id": interview_id,
+        "interviewer_id": interviewer_id,
+        "overall_recommendation": body.overall_recommendation,
+        "skills_level": body.skills_level,
+        "communication_level": body.communication_level,
+        "jd_fit_level": body.jd_fit_level,
+        "flags": body.flags,
+        "comment": body.comment,
+        "skills_score": scores["skills_score"],
+        "communication_score": scores["communication_score"],
+        "jd_fit_score": scores["jd_fit_score"],
+        "overall_score": scores["overall_score"],
+    }
+
+    fb = (
+        supabase.table("interview_feedback")
+        .upsert(row, on_conflict="interview_id,interviewer_id")
+        .execute()
+        .data[0]
+    )
+
+    # 4) Also store overall_score on interviews row for quick sort
+    try:
+        supabase.table("interviews").update(
+            {"feedback_overall_score": scores["overall_score"]}
+        ).eq("interview_id", interview_id).execute()
+    except Exception as e:
+        print("[feedback] failed to update interviews.feedback_overall_score:", e)
+
+    return {
+        "interview_id": interview_id,
+        "feedback": fb,
+        "scores": scores,
+    }
+
 @app.post("/jobs/{job_id}/resumes/shortlist")
 async def shortlist_resumes(
     job_id: str,
@@ -3677,6 +4048,52 @@ async def update_interview_status(interview_id: str, body: InterviewStatusIn,
     if not row:
         raise HTTPException(404, "Interview not found")
     return {"interview_id": interview_id, "status": body.status}
+
+@app.post("/recruiter/interviews/{interview_id}/decision")
+async def recruiter_set_decision(
+    interview_id: str,
+    body: RecruiterDecisionIn,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    """
+    Recruiter sets final/next-step decision for an interview.
+    Allowed statuses: REVIEW, HIRED, REJECTED, SELECTED.
+    Also stores recruiter_note.
+    """
+    # 1) Fetch interview
+    interview = _first_row(
+        supabase.table("interviews")
+        .select("interview_id, job_id, status, recruiter_note")
+        .eq("interview_id", interview_id)
+        .limit(1)
+        .execute()
+    )
+    if not interview:
+        raise HTTPException(404, "Interview not found")
+
+    # 2) Ensure this recruiter owns the job
+    _ = _get_job_owned(interview["job_id"], current_user)
+
+    # 3) Update interview status + note
+    update_data: Dict[str, Any] = {"status": body.status}
+    if body.note is not None:
+        update_data["recruiter_note"] = body.note
+
+    updated = (
+        supabase.table("interviews")
+        .update(update_data)
+        .eq("interview_id", interview_id)
+        .execute()
+        .data
+    )
+    if not updated:
+        raise HTTPException(404, "Interview not found after update")
+
+    return {
+        "interview_id": interview_id,
+        "status": body.status,
+        "recruiter_note": body.note,
+    }
 
 # ─────────────────────────────────────────────
 # MeetAI session endpoints (reuse same DB)
