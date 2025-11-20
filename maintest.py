@@ -321,6 +321,25 @@ class RecruiterDecisionIn(BaseModel):
     status: Literal["REVIEW", "HIRED", "REJECTED", "SELECTED"]
     note: Optional[str] = None  # recruiter internal note
 
+class HiredEmailIn(BaseModel):
+    start_iso: str        # joining start datetime with tz (e.g. 2025-12-01T10:00:00+05:30)
+    end_iso: str          # end of that first day
+    location: str
+    timezone: str = "Asia/Kolkata"
+
+
+class AssignmentEmailIn(BaseModel):
+    deadline_iso: str     # assignment deadline datetime
+    link: str
+    description: str
+    timezone: str = "Asia/Kolkata"
+
+
+class RejectEmailIn(BaseModel):
+    # Optional; if not provided, we'll default to "today" as an all-day event
+    date: Optional[str] = None   # YYYY-MM-DD
+    timezone: str = "Asia/Kolkata"
+
 # ---------------------------------------------------------------------------
 # Auth helpers
 # ---------------------------------------------------------------------------
@@ -653,6 +672,112 @@ def _get_job_owned(job_id: str, user: UserIdentity) -> dict:
         raise HTTPException(404, "Job not found or unauthorized")
 
     return job
+
+def _get_recruiter_interview_context(
+    interview_id: str,
+    current_user: UserIdentity,
+) -> Dict[str, Any]:
+    """
+    Load interview + job + resume (+company) ensuring the current user owns the job.
+    Returns dict: {interview, job, resume, company}
+    """
+    interview = _first_row(
+        supabase.table("interviews")
+        .select("*")
+        .eq("interview_id", interview_id)
+        .limit(1)
+        .execute()
+    )
+    if not interview:
+        raise HTTPException(404, "Interview not found")
+
+    job = _get_job_owned(interview["job_id"], current_user)
+
+    resume = _first_row(
+        supabase.table("resumes")
+        .select("resume_id, full_name, email")
+        .eq("resume_id", interview["resume_id"])
+        .limit(1)
+        .execute()
+    )
+
+    company = None
+    if job.get("company_id"):
+        company = _first_row(
+            supabase.table("companies")
+            .select("company_name")
+            .eq("company_id", job["company_id"])
+            .limit(1)
+            .execute()
+        )
+
+    return {
+        "interview": interview,
+        "job": job,
+        "resume": resume,
+        "company": company,
+    }
+
+def _hired_email_body(candidate_name: str, role: str, company_name: str,
+                      start_iso: str, location: str) -> str:
+    return f"""
+Hi {candidate_name or "there"},
+
+We are pleased to inform you that you have been selected for the role of {role} at {company_name}.
+
+Your joining details are as follows:
+- Start date & time: {start_iso}
+- Location: {location}
+
+Our HR team will share the remaining formalities and documentation shortly. 
+If you have any questions or need clarification, feel free to reply to this email.
+
+Welcome on board!
+
+Best regards,
+{company_name} Recruitment Team
+""".strip()
+
+
+def _rejected_email_body(candidate_name: str, role: str, company_name: str) -> str:
+    return f"""
+Hi {candidate_name or "there"},
+
+Thank you for taking the time to interview for the {role} position at {company_name}.
+
+After careful consideration, we will not be moving forward with your application at this time.
+This decision was not easy, and it does not diminish your skills or experience.
+
+We truly appreciate your interest in {company_name} and encourage you to apply for future roles that match your profile.
+
+Wishing you all the best in your job search.
+
+Best regards,
+{company_name} Recruitment Team
+""".strip()
+
+
+def _assignment_email_body(candidate_name: str, role: str, company_name: str,
+                           deadline_iso: str, link: str, description: str) -> str:
+    return f"""
+Hi {candidate_name or "there"},
+
+As the next step for the {role} position at {company_name}, we would like you to complete a short assignment.
+
+Details:
+- Submission deadline: {deadline_iso}
+- Assignment link: {link}
+
+Instructions:
+{description}
+
+Please share your solution before the deadline. If you have any questions or need clarification, reply to this email.
+
+Best of luck!
+
+Best regards,
+{company_name} Recruitment Team
+""".strip()
 
 def _get_company_id_for_user(user: UserIdentity) -> Optional[str]:
     rec = (
@@ -4540,6 +4665,233 @@ RECENT TRANSCRIPT:
         questions = [x.strip("-• ").strip() for x in raw.split("\n") if x.strip()]
     questions = [q for q in questions if q][:count]
     return {"session_id": session_id, "questions": questions}
+
+@app.post("/recruiter/interviews/{interview_id}/email/hired")
+async def send_hired_email(
+    interview_id: str,
+    body: HiredEmailIn,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    ctx = _get_recruiter_interview_context(interview_id, current_user)
+    interview, job, resume, company = ctx["interview"], ctx["job"], ctx["resume"], ctx["company"]
+
+    # Idempotency: if already sent, just return
+    if interview.get("hired_email_sent_at"):
+        return {
+            "interview_id": interview_id,
+            "already_sent": True,
+        }
+
+    candidate_email = (resume or {}).get("email") or interview.get("candidate_email")
+    candidate_name = (resume or {}).get("full_name")
+    role = job.get("role") or "Position"
+    company_name = (company or {}).get("company_name") or "our company"
+
+    description = _hired_email_body(
+        candidate_name=candidate_name,
+        role=role,
+        company_name=company_name,
+        start_iso=body.start_iso,
+        location=body.location,
+    )
+
+    try:
+        svc = _google_service_for_user(current_user.user_id)
+    except HTTPException:
+        # bubble up our own HTTPException
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Google connection failed: {e}")
+
+    event = {
+        "summary": f"Offer Confirmation — {role} at {company_name}",
+        "location": body.location,
+        "start": {"dateTime": body.start_iso, "timeZone": body.timezone},
+        "end":   {"dateTime": body.end_iso,   "timeZone": body.timezone},
+        "attendees": [
+            {"email": candidate_email},
+            {"email": current_user.email},
+        ],
+        "description": description,
+    }
+
+    try:
+        created = svc.events().insert(
+            calendarId="primary",
+            body=event,
+            sendUpdates="all",
+        ).execute()
+    except Exception as e:
+        raise HTTPException(502, f"Failed to create calendar event: {e}")
+
+    # Mark as sent + optionally bump status to HIRED
+    now_iso = datetime.datetime.utcnow().isoformat() + "Z"
+    supabase.table("interviews").update(
+        {
+            "hired_email_sent_at": now_iso,
+            "status": "HIRED",
+        }
+    ).eq("interview_id", interview_id).execute()
+
+    return {
+        "interview_id": interview_id,
+        "status": "HIRED",
+        "already_sent": False,
+        "calendar_link": created.get("htmlLink"),
+    }
+
+@app.post("/recruiter/interviews/{interview_id}/email/rejected")
+async def send_rejected_email(
+    interview_id: str,
+    body: RejectEmailIn,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    ctx = _get_recruiter_interview_context(interview_id, current_user)
+    interview, job, resume, company = ctx["interview"], ctx["job"], ctx["resume"], ctx["company"]
+
+    if interview.get("rejected_email_sent_at"):
+        return {
+            "interview_id": interview_id,
+            "already_sent": True,
+        }
+
+    candidate_email = (resume or {}).get("email") or interview.get("candidate_email")
+    candidate_name = (resume or {}).get("full_name")
+    role = job.get("role") or "Position"
+    company_name = (company or {}).get("company_name") or "our company"
+
+    desc = _rejected_email_body(
+        candidate_name=candidate_name,
+        role=role,
+        company_name=company_name,
+    )
+
+    # All-day event date
+    if body.date:
+        date_str = body.date
+    else:
+        date_str = datetime.date.today().isoformat()
+
+    try:
+        svc = _google_service_for_user(current_user.user_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Google connection failed: {e}")
+
+    # All-day event uses 'date' instead of 'dateTime'
+    event = {
+        "summary": f"Application decision — {role} at {company_name}",
+        "start": {"date": date_str},
+        "end": {"date": date_str},
+        "attendees": [
+            {"email": candidate_email},
+            {"email": current_user.email},
+        ],
+        "description": desc,
+    }
+
+    try:
+        created = svc.events().insert(
+            calendarId="primary",
+            body=event,
+            sendUpdates="all",
+        ).execute()
+    except Exception as e:
+        raise HTTPException(502, f"Failed to create calendar event: {e}")
+
+    now_iso = datetime.datetime.utcnow().isoformat() + "Z"
+    supabase.table("interviews").update(
+        {
+            "rejected_email_sent_at": now_iso,
+            "status": "REJECTED",
+        }
+    ).eq("interview_id", interview_id).execute()
+
+    return {
+        "interview_id": interview_id,
+        "status": "REJECTED",
+        "already_sent": False,
+        "calendar_link": created.get("htmlLink"),
+    }
+
+@app.post("/recruiter/interviews/{interview_id}/email/assignment")
+async def send_assignment_email(
+    interview_id: str,
+    body: AssignmentEmailIn,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    ctx = _get_recruiter_interview_context(interview_id, current_user)
+    interview, job, resume, company = ctx["interview"], ctx["job"], ctx["resume"], ctx["company"]
+
+    if interview.get("assignment_email_sent_at"):
+        return {
+            "interview_id": interview_id,
+            "already_sent": True,
+        }
+
+    candidate_email = (resume or {}).get("email") or interview.get("candidate_email")
+    candidate_name = (resume or {}).get("full_name")
+    role = job.get("role") or "Position"
+    company_name = (company or {}).get("company_name") or "our company"
+
+    desc = _assignment_email_body(
+        candidate_name=candidate_name,
+        role=role,
+        company_name=company_name,
+        deadline_iso=body.deadline_iso,
+        link=body.link,
+        description=body.description,
+    )
+
+    try:
+        svc = _google_service_for_user(current_user.user_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Google connection failed: {e}")
+
+    # Make event 30 minutes long ending at deadline
+    try:
+        dt_deadline = datetime.datetime.fromisoformat(body.deadline_iso.replace("Z", "+00:00"))
+    except Exception:
+        raise HTTPException(400, "Invalid deadline_iso format")
+
+    end_dt = dt_deadline + datetime.timedelta(minutes=30)
+    end_iso = end_dt.isoformat()
+
+    event = {
+        "summary": f"Assignment for {role} — {company_name}",
+        "start": {"dateTime": body.deadline_iso, "timeZone": body.timezone},
+        "end":   {"dateTime": end_iso,          "timeZone": body.timezone},
+        "attendees": [
+            {"email": candidate_email},
+            {"email": current_user.email},
+        ],
+        "description": desc,
+    }
+
+    try:
+        created = svc.events().insert(
+            calendarId="primary",
+            body=event,
+            sendUpdates="all",
+        ).execute()
+    except Exception as e:
+        raise HTTPException(502, f"Failed to create calendar event: {e}")
+
+    now_iso = datetime.datetime.utcnow().isoformat() + "Z"
+    supabase.table("interviews").update(
+        {
+            "assignment_email_sent_at": now_iso,
+        }
+    ).eq("interview_id", interview_id).execute()
+
+    return {
+        "interview_id": interview_id,
+        "already_sent": False,
+        "calendar_link": created.get("htmlLink"),
+    }
 
 # ---------------------------------------------------------------------------
 # run (local)
