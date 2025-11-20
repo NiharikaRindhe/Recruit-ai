@@ -630,19 +630,28 @@ def _detect_missing_fields(parsed: Dict[str, Any]) -> List[Dict[str, str]]:
 def _download_from_storage(key: str) -> bytes:
     bucket = supabase.storage.from_(RESUME_BUCKET)
     return bucket.download(key)
-
 def _get_job_owned(job_id: str, user: UserIdentity) -> dict:
-    job = (
+    """
+    Fetch a job that belongs to the current recruiter.
+    Returns the job dict or raises 404 if not found / not owned.
+
+    Uses .limit(1) + _first_row instead of .single() so we don't
+    get PGRST116 when there are 0 rows.
+    """
+    resp = (
         supabase.table("jobs")
         .select("*")
         .eq("job_id", job_id)
         .eq("created_by", user.user_id)
-        .single()
+        .limit(1)
         .execute()
-        .data
     )
+    job = _first_row(resp)
+
     if not job:
+        # no job for this user → either wrong job_id or unauthorized
         raise HTTPException(404, "Job not found or unauthorized")
+
     return job
 
 def _get_company_id_for_user(user: UserIdentity) -> Optional[str]:
@@ -2702,8 +2711,9 @@ async def recruiter_candidates_ranked(
     current_user: UserIdentity = Depends(get_current_user),
 ):
     """
-    For a given job, return candidates ranked by combined score:
-    JD match + interviewer feedback + AI report.
+    For a given job, return ONLY candidates who have an interview with
+    status in {INTERVIEW_SCHEDULED, INTERVIEW_DONE, ABSENT}, ranked by
+    combined score: JD match + interviewer feedback + AI report.
     """
     # Ensure this recruiter owns the job
     job = _get_job_owned(job_id, current_user)
@@ -2725,15 +2735,23 @@ async def recruiter_candidates_ranked(
 
     resume_ids = [r["resume_id"] for r in resumes]
 
-    # 2) Interviews for those resumes
+    # Only consider these interview statuses
+    RANKABLE_STATUSES = ["INTERVIEW_SCHEDULED", "INTERVIEW_DONE", "ABSENT"]
+
+    # 2) Interviews for those resumes, filtered by status
     interviews = (
         supabase.table("interviews")
         .select("interview_id, resume_id, status, feedback_overall_score")
         .in_("resume_id", resume_ids)
+        .in_("status", RANKABLE_STATUSES)
         .execute()
         .data
         or []
     )
+    if not interviews:
+        # No interviews in the desired statuses
+        return {"job_id": job_id, "role": job.get("role"), "candidates": []}
+
     interviews_by_resume = {i["resume_id"]: i for i in interviews}
     interview_ids = [i["interview_id"] for i in interviews]
 
@@ -2763,22 +2781,8 @@ async def recruiter_candidates_ranked(
     for r in resumes:
         it = interviews_by_resume.get(r["resume_id"])
         if not it:
-            # No interview yet; still include but score will be low
-            final_score_val = final_candidate_score(r.get("jd_match_score"), None, None)
-            items.append(
-                {
-                    "resume_id": r["resume_id"],
-                    "candidate_id": r.get("candidate_id"),
-                    "full_name": r.get("full_name"),
-                    "email": r.get("email"),
-                    "jd_match_score": r.get("jd_match_score"),
-                    "feedback_overall_score": None,
-                    "ai_overall_score": None,
-                    "interview_id": None,
-                    "interview_status": None,
-                    "final_score": final_score_val,
-                }
-            )
+            # This resume either has no interview OR only interviews with
+            # statuses outside RANKABLE_STATUSES -> skip it.
             continue
 
         fb_row = fb_by_interview.get(it["interview_id"])
