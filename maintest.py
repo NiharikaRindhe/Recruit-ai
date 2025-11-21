@@ -4764,7 +4764,6 @@ async def ai_validate(payload: Dict[str, str] = Body(...)):
     resume = meeting.get("resume", "")
     jd = meeting.get("jd", "")
     turns = _recent_turns(session_id, 300)
-    convo = _turns_snippet(turns, 12)
 
     cand_answer = _extract_candidate_answer(
         question,
@@ -4780,7 +4779,7 @@ Return STRICT JSON with keys:
 - score (0.0–1.0)
 - explanation (1–3 short sentences)
 - expected_answer
-- from FULL TRANSCRIPT extract candidate_answer for that perticuler question
+- candidate_answer
 
 Use:
 RESUME:
@@ -4792,8 +4791,8 @@ JD:
 QUESTION:
 {question}
 
-FULL TRANSCRIPT:
-{convo}
+CANDIDATE_ANSWER:
+{cand_answer if cand_answer else "(none)"} 
 
 GUIDELINES:
 
@@ -4812,7 +4811,7 @@ GUIDELINES:
    - For broad questions like "Tell me about yourself" / "Introduce yourself" / "Walk me through your profile":
      • If the answer is generally consistent with the resume and JD (even if brief), use at least "OK", not "LIMITED".
      • Do NOT mark an answer as bad just because it doesn't repeat every project or metric from the resume.
-     • .
+     • Minor differences in phrasing or missing achievements are acceptable.
 
 3) SCORE:
    - score is a float between 0.0 and 1.0.
