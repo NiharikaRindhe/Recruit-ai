@@ -2483,7 +2483,19 @@ def _ensure_list_of_str(value) -> list[str]:
         return [p.strip() for p in parts if p.strip()]
     return []
 
-ALLOWED_RESUME_STATUSES = {"PENDING", "PARSED", "REJECTED","SHORTLISTED","INTERVIEW_SCHEDULED"}
+ALLOWED_RESUME_STATUSES = {
+    "PENDING",
+    "PARSED",
+    "SHORTLISTED",
+    "INTERVIEW_SCHEDULED",
+    "INTERVIEW_DONE",
+    "REVIEW",
+    "SELECTED",
+    "REJECTED",
+    "HIRED",
+    "ABSENT",
+    "CANCELLED",
+}
 
 EXTRACT_PROMPT = (
     "You are a resume parsing assistant. Return ONLY JSON with these exact top-level keys: "
@@ -2539,6 +2551,24 @@ CANDIDATE (parsed & truncated):
 
 Only use information present above. Be specific, avoid fluff. Keep total under ~250 words.
 """.strip()
+
+def _update_resume_status(resume_id: Optional[str], new_status: str) -> None:
+    """
+    Safely update the status of a resume row.
+    - No-op if resume_id is None.
+    - Ignores statuses not in ALLOWED_RESUME_STATUSES (to avoid typos).
+    """
+    if not resume_id:
+        return
+    if new_status not in ALLOWED_RESUME_STATUSES:
+        return
+
+    try:
+        supabase.table("resumes").update({"status": new_status}).eq(
+            "resume_id", resume_id
+        ).execute()
+    except Exception as e:
+        print(f"[resume_status] failed to update for {resume_id}: {e}")
 
 def generate_resume_analysis(
     candidate: dict,
@@ -4326,14 +4356,51 @@ class InterviewStatusIn(BaseModel):
     status: str  # validate against the enum in code too
 
 @app.post("/interviews/{interview_id}/status")
-async def update_interview_status(interview_id: str, body: InterviewStatusIn,
-                                  current_user: UserIdentity = Depends(get_current_user)):
-    allowed = {"INTERVIEW_SCHEDULED","INTERVIEW_DONE","SELECTED","REJECTED","REVIEW","HIRED","ABSENT","CANCELLED"}
+async def update_interview_status(
+    interview_id: str,
+    body: InterviewStatusIn,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    allowed = {
+        "INTERVIEW_SCHEDULED",
+        "INTERVIEW_DONE",
+        "SELECTED",
+        "REJECTED",
+        "REVIEW",
+        "HIRED",
+        "ABSENT",
+        "CANCELLED",
+    }
     if body.status not in allowed:
         raise HTTPException(400, "Invalid status")
-    row = supabase.table("interviews").update({"status": body.status}).eq("interview_id", interview_id).execute().data
-    if not row:
+
+    resp = (
+        supabase.table("interviews")
+        .update({"status": body.status})
+        .eq("interview_id", interview_id)
+        .execute()
+    )
+    rows = resp.data or []
+    if not rows:
         raise HTTPException(404, "Interview not found")
+
+    updated_row = rows[0]
+
+    # 🔥 Sync resume status for pipeline-relevant states
+    # (You can adjust this set if you don't want all to show up on resumes)
+    if body.status in {
+        "INTERVIEW_SCHEDULED",
+        "INTERVIEW_DONE",
+        "REVIEW",
+        "SELECTED",
+        "REJECTED",
+        "HIRED",
+        "ABSENT",
+        "CANCELLED",
+    }:
+        resume_id = updated_row.get("resume_id")
+        _update_resume_status(resume_id, body.status)
+
     return {"interview_id": interview_id, "status": body.status}
 
 @app.post("/recruiter/interviews/{interview_id}/decision")
@@ -4350,7 +4417,7 @@ async def recruiter_set_decision(
     # 1) Fetch interview
     interview = _first_row(
         supabase.table("interviews")
-        .select("interview_id, job_id, status, recruiter_note")
+        .select("interview_id, job_id, resume_id, status, recruiter_note")  # 👈 added resume_id
         .eq("interview_id", interview_id)
         .limit(1)
         .execute()
@@ -4375,6 +4442,10 @@ async def recruiter_set_decision(
     )
     if not updated:
         raise HTTPException(404, "Interview not found after update")
+
+    # 4) 🔥 KEEP RESUME IN SYNC
+    resume_id = interview.get("resume_id")
+    _update_resume_status(resume_id, body.status)
 
     return {
         "interview_id": interview_id,
@@ -4693,6 +4764,7 @@ async def ai_validate(payload: Dict[str, str] = Body(...)):
     resume = meeting.get("resume", "")
     jd = meeting.get("jd", "")
     turns = _recent_turns(session_id, 300)
+    convo = _turns_snippet(turns, 12)
 
     cand_answer = _extract_candidate_answer(
         question,
@@ -4708,7 +4780,7 @@ Return STRICT JSON with keys:
 - score (0.0–1.0)
 - explanation (1–3 short sentences)
 - expected_answer
-- candidate_answer
+- from FULL TRANSCRIPT extract candidate_answer for that perticuler question
 
 Use:
 RESUME:
@@ -4720,8 +4792,8 @@ JD:
 QUESTION:
 {question}
 
-CANDIDATE_ANSWER:
-{cand_answer if cand_answer else "(none)"} 
+FULL TRANSCRIPT:
+{convo}
 
 GUIDELINES:
 
@@ -4740,7 +4812,7 @@ GUIDELINES:
    - For broad questions like "Tell me about yourself" / "Introduce yourself" / "Walk me through your profile":
      • If the answer is generally consistent with the resume and JD (even if brief), use at least "OK", not "LIMITED".
      • Do NOT mark an answer as bad just because it doesn't repeat every project or metric from the resume.
-     • Minor differences in phrasing or missing achievements are acceptable.
+     • .
 
 3) SCORE:
    - score is a float between 0.0 and 1.0.
