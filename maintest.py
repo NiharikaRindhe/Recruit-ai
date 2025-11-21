@@ -3049,7 +3049,15 @@ async def recruiter_candidates_ranked(
     resume_ids = [r["resume_id"] for r in resumes]
 
     # Only consider these interview statuses
-    RANKABLE_STATUSES = ["INTERVIEW_SCHEDULED", "INTERVIEW_DONE", "ABSENT"]
+    RANKABLE_STATUSES = [
+        "INTERVIEW_SCHEDULED",
+        "INTERVIEW_DONE",
+        "ABSENT",
+        "REVIEW",
+        "SELECTED",
+        "REJECTED",
+        "HIRED",
+    ]
 
     # 2) Interviews for those resumes, filtered by status
     interviews = (
