@@ -17,7 +17,26 @@ from supabase import create_client, Client
 from dotenv import load_dotenv
 import jwt
 import requests
-# imports (near the top)
+# --- MeetAI extra imports (add to existing imports) ---
+import asyncio
+import time
+import threading
+import queue
+from pathlib import Path
+from functools import lru_cache
+
+from fastapi import WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse  # you already import JSONResponse
+
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.openapi.utils import get_openapi
+
+# Google Cloud STT
+from google.cloud import speech
+from google.oauth2 import service_account
+
+# imports
 from supabase.client import ClientOptions
 import datetime
 from fastapi import Request
@@ -138,6 +157,8 @@ public_sb: Client = create_client(
 
 # Keep all your DB/storage code working without edits:
 supabase: Client = admin_sb
+# After your existing Supabase setup
+SUPABASE_ENABLED = bool(SUPABASE_URL and SUPABASE_SERVICE_KEY)
 
 INVITE_REDIRECT = os.getenv("INTERVIEWER_INVITE_REDIRECT")
 RESET_REDIRECT  = os.getenv("PASSWORD_RESET_REDIRECT")
@@ -275,6 +296,49 @@ class CopilotFinalIn(BaseModel):
         default=None,
         description="Optional numeric ratings per competency, e.g. {'problem_solving': 4, 'communication': 3}"
     )
+
+# -------- Interview feedback & recruiter decision models --------
+
+from typing import Literal  # you already imported this above, so skip if present
+
+class InterviewFeedbackIn(BaseModel):
+    # Radio buttons from interviewer UI
+    overall_recommendation: Literal["STRONG_HIRE", "HIRE", "UNSURE", "DO_NOT_HIRE"]
+    skills_level: Literal["LOW", "MEDIUM", "HIGH"]
+    communication_level: Literal["NEEDS_WORK", "OKAY", "STRONG"]
+    jd_fit_level: Literal["PERFECT", "GOOD", "PARTIAL", "UNCERTAIN"]
+
+    # Checkboxes: will map your UI keys → booleans
+    # e.g. { strong_tech_depth: true, collab_mindset: true, needs_clarity: false, limited_data: false }
+    flags: Dict[str, bool] = Field(default_factory=dict)
+
+    # Free-text comment from interviewer
+    comment: Optional[str] = None
+
+
+class RecruiterDecisionIn(BaseModel):
+    # What recruiter decides for this interview
+    status: Literal["REVIEW", "HIRED", "REJECTED", "SELECTED"]
+    note: Optional[str] = None  # recruiter internal note
+
+class HiredEmailIn(BaseModel):
+    start_iso: str        # joining start datetime with tz (e.g. 2025-12-01T10:00:00+05:30)
+    end_iso: str          # end of that first day
+    location: str
+    timezone: str = "Asia/Kolkata"
+
+
+class AssignmentEmailIn(BaseModel):
+    deadline_iso: str     # assignment deadline datetime
+    link: str
+    description: str
+    timezone: str = "Asia/Kolkata"
+
+
+class RejectEmailIn(BaseModel):
+    # Optional; if not provided, we'll default to "today" as an all-day event
+    date: Optional[str] = None   # YYYY-MM-DD
+    timezone: str = "Asia/Kolkata"
 
 # ---------------------------------------------------------------------------
 # Auth helpers
@@ -585,20 +649,135 @@ def _detect_missing_fields(parsed: Dict[str, Any]) -> List[Dict[str, str]]:
 def _download_from_storage(key: str) -> bytes:
     bucket = supabase.storage.from_(RESUME_BUCKET)
     return bucket.download(key)
-
 def _get_job_owned(job_id: str, user: UserIdentity) -> dict:
-    job = (
+    """
+    Fetch a job that belongs to the current recruiter.
+    Returns the job dict or raises 404 if not found / not owned.
+
+    Uses .limit(1) + _first_row instead of .single() so we don't
+    get PGRST116 when there are 0 rows.
+    """
+    resp = (
         supabase.table("jobs")
         .select("*")
         .eq("job_id", job_id)
         .eq("created_by", user.user_id)
-        .single()
+        .limit(1)
         .execute()
-        .data
     )
+    job = _first_row(resp)
+
     if not job:
+        # no job for this user → either wrong job_id or unauthorized
         raise HTTPException(404, "Job not found or unauthorized")
+
     return job
+
+def _get_recruiter_interview_context(
+    interview_id: str,
+    current_user: UserIdentity,
+) -> Dict[str, Any]:
+    """
+    Load interview + job + resume (+company) ensuring the current user owns the job.
+    Returns dict: {interview, job, resume, company}
+    """
+    interview = _first_row(
+        supabase.table("interviews")
+        .select("*")
+        .eq("interview_id", interview_id)
+        .limit(1)
+        .execute()
+    )
+    if not interview:
+        raise HTTPException(404, "Interview not found")
+
+    job = _get_job_owned(interview["job_id"], current_user)
+
+    resume = _first_row(
+        supabase.table("resumes")
+        .select("resume_id, full_name, email")
+        .eq("resume_id", interview["resume_id"])
+        .limit(1)
+        .execute()
+    )
+
+    company = None
+    if job.get("company_id"):
+        company = _first_row(
+            supabase.table("companies")
+            .select("company_name")
+            .eq("company_id", job["company_id"])
+            .limit(1)
+            .execute()
+        )
+
+    return {
+        "interview": interview,
+        "job": job,
+        "resume": resume,
+        "company": company,
+    }
+
+def _hired_email_body(candidate_name: str, role: str, company_name: str,
+                      start_iso: str, location: str) -> str:
+    return f"""
+Hi {candidate_name or "there"},
+
+We are pleased to inform you that you have been selected for the role of {role} at {company_name}.
+
+Your joining details are as follows:
+- Start date & time: {start_iso}
+- Location: {location}
+
+Our HR team will share the remaining formalities and documentation shortly. 
+If you have any questions or need clarification, feel free to reply to this email.
+
+Welcome on board!
+
+Best regards,
+{company_name} Recruitment Team
+""".strip()
+
+
+def _rejected_email_body(candidate_name: str, role: str, company_name: str) -> str:
+    return f"""
+Hi {candidate_name or "there"},
+
+Thank you for taking the time to interview for the {role} position at {company_name}.
+
+After careful consideration, we will not be moving forward with your application at this time.
+This decision was not easy, and it does not diminish your skills or experience.
+
+We truly appreciate your interest in {company_name} and encourage you to apply for future roles that match your profile.
+
+Wishing you all the best in your job search.
+
+Best regards,
+{company_name} Recruitment Team
+""".strip()
+
+
+def _assignment_email_body(candidate_name: str, role: str, company_name: str,
+                           deadline_iso: str, link: str, description: str) -> str:
+    return f"""
+Hi {candidate_name or "there"},
+
+As the next step for the {role} position at {company_name}, we would like you to complete a short assignment.
+
+Details:
+- Submission deadline: {deadline_iso}
+- Assignment link: {link}
+
+Instructions:
+{description}
+
+Please share your solution before the deadline. If you have any questions or need clarification, reply to this email.
+
+Best of luck!
+
+Best regards,
+{company_name} Recruitment Team
+""".strip()
 
 def _get_company_id_for_user(user: UserIdentity) -> Optional[str]:
     rec = (
@@ -782,6 +961,626 @@ def _first_row(resp):
     if isinstance(data, list):
         return data[0] if data else None
     return data
+
+# ─────────────────────────────────────────────
+# Google STT helpers (MeetAI)
+# ─────────────────────────────────────────────
+MAX_STREAM_SECONDS = 290  # keep from meetai.py
+
+def get_speech_client() -> speech.SpeechClient:
+    """
+    Uses GOOGLE_APPLICATION_CREDENTIALS if set, otherwise looks for service-account.json
+    in the backend folder, otherwise falls back to ADC.
+    """
+    env_path = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    if env_path and os.path.exists(env_path):
+        creds = service_account.Credentials.from_service_account_file(env_path)
+        print(f"[startup] using credentials from env: {env_path}")
+        return speech.SpeechClient(credentials=creds)
+    local = Path(__file__).with_name("service-account.json")
+    if local.exists():
+        creds = service_account.Credentials.from_service_account_file(str(local))
+        print("[startup] using credentials from backend/service-account.json")
+        return speech.SpeechClient(credentials=creds)
+    print("[startup] using ADC")
+    return speech.SpeechClient()
+
+def make_recognition_config():
+    return speech.RecognitionConfig(
+        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
+        sample_rate_hertz=16000,
+        language_code="en-US",
+        enable_automatic_punctuation=True,
+        use_enhanced=True,
+        model="default",
+    )
+
+def make_streaming_config():
+    return speech.StreamingRecognitionConfig(
+        config=make_recognition_config(),
+        interim_results=True,
+        single_utterance=False,
+    )
+# ─────────────────────────────────────────────
+# Meetings + transcript + ai_report helpers
+# ─────────────────────────────────────────────
+
+def _sb_get_meeting(session_id: str) -> dict:
+    if not SUPABASE_ENABLED:
+        return {}
+    try:
+        m = (
+            supabase
+            .table("meetings")
+            .select("*")
+            .eq("meeting_id", session_id)
+            .limit(1)
+            .execute()
+        )
+        data = getattr(m, "data", None)
+        if data:
+            return data[0]
+    except Exception as e:
+        print(f"[sb] get meeting error: {e}")
+    return {}
+
+def _sb_upd_meeting_transcript(session_id: str, new_transcript: str) -> None:
+    if not SUPABASE_ENABLED:
+        return
+    try:
+        supabase.table("meetings").update({"transcript": new_transcript}).eq(
+            "meeting_id", session_id
+        ).execute()
+    except Exception as e:
+        print(f"[sb] update transcript error: {e}")
+
+def _append_transcript_line(session_id: str, speaker_name: str, text: str) -> None:
+    mtg = _sb_get_meeting(session_id)
+    prev = mtg.get("transcript") or ""
+    line = f"{speaker_name}: {text}".strip()
+    new = (prev.rstrip() + "\n" + line) if prev.strip() else line
+    _sb_upd_meeting_transcript(session_id, new)
+
+def _sb_upsert_ai_report(session_id: str, report: dict) -> None:
+    """
+    Store AI summary json into meetings.ai_report (jsonb).
+    """
+    if not SUPABASE_ENABLED:
+        return
+    try:
+        safe_report = json.loads(json.dumps(report, ensure_ascii=False))
+    except Exception as e:
+        print(f"[sb] ai_report not JSON-serializable: {e}")
+        return
+    try:
+        supabase.table("meetings").update({"ai_report": safe_report}).eq(
+            "meeting_id", session_id
+        ).execute()
+    except Exception as e:
+        print(f"[sb] update meetings.ai_report error: {e}")
+
+# ─────────────────────────────────────────────
+# MeetAI LLM helper – reuse generate_jd_with_ollama
+# ─────────────────────────────────────────────
+
+def _ollama_chat_json(prompt: str, temperature: float = 0.2) -> dict:
+    """
+    Call your existing generate_jd_with_ollama() (which hits Ollama HTTP /generate)
+    and try to parse the response as JSON.
+    If parsing fails, return {"raw": text}.
+    """
+    # you can modify generate_jd_with_ollama to accept temperature if you want;
+    # for now we just ignore the temperature param.
+    text = generate_jd_with_ollama(prompt)
+    text = (text or "").strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        return {"raw": text}
+
+# ─────────────────────────────────────────────
+# Formatting helpers (bullets, etc.)
+# ─────────────────────────────────────────────
+_CODE_FENCE = re.compile(r"```.*?```", flags=re.S)
+
+
+def _strip_code_and_json(s: str) -> str:
+    if not s:
+        return ""
+    s = _CODE_FENCE.sub("", s)
+    s = s.replace("`", " ")
+    s = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", s)
+    s = re.sub(r"\*+", "", s)
+    s = re.sub(r"_+", "", s)
+    s = s.strip()
+    if s.startswith("{") and s.endswith("}"):
+        try:
+            obj = json.loads(s)
+            s = obj.get("explanation") or obj.get("expected_answer") or ""
+        except Exception:
+            s = ""
+    return s.strip()
+
+
+def _to_bullets(s: str, max_items: int = 6, max_len: int = 180) -> str:
+    s = _strip_code_and_json(s)
+    if not s:
+        return ""
+    parts = re.split(r"[\r\n]+|(?:^|[\s])[-–•·]\s+", s)
+    parts = [p.strip(" -–•\t\r\n") for p in parts if p and p.strip()]
+    if len(parts) <= 1:
+        parts = re.split(r"(?<=[.!?])\s+", s)
+    clean = []
+    for p in parts:
+        p = re.sub(r"\s+", " ", p).strip()
+        if not p:
+            continue
+        if len(p) > max_len:
+            p = p[: max_len - 1].rstrip() + "…"
+        clean.append(p)
+        if len(clean) >= max_items:
+            break
+    if not clean:
+        return ""
+    return "\n".join(f"• {p}" for p in clean)
+
+
+# Transcript → pseudo turns
+def _parse_transcript_to_turns(
+    transcript_text: str, interviewer_name: str, candidate_name: str
+) -> list[dict]:
+    if not (transcript_text or "").strip():
+        return []
+    out: list[dict] = []
+    lines = [ln.strip() for ln in transcript_text.splitlines() if ln.strip()]
+    for ln in lines:
+        if ":" in ln:
+            name, msg = ln.split(":", 1)
+            name = name.strip()
+            msg = msg.strip()
+        else:
+            if out:
+                out[-1]["text"] += " " + ln
+                continue
+            name, msg = "Unknown", ln
+
+        role = "unknown"
+        if interviewer_name and name.lower() == interviewer_name.lower():
+            role = "interviewer"
+        elif candidate_name and name.lower() == candidate_name.lower():
+            role = "candidate"
+        else:
+            if name.lower() in ("interviewer", "mic"):
+                role = "interviewer"
+            elif name.lower() in ("candidate", "tab"):
+                role = "candidate"
+
+        out.append(
+            {
+                "source": "mic"
+                if role == "interviewer"
+                else ("tab" if role == "candidate" else "unknown"),
+                "speaker": role,
+                "speaker_name": name,
+                "text": msg,
+                "is_final": True,
+            }
+        )
+    return out
+
+def google_stt_worker(
+    source: str,
+    session_id: Optional[str],
+    speaker: str,
+    speaker_name: str,
+    client: speech.SpeechClient,
+    audio_q: "queue.Queue[Optional[bytes]]",
+    loop: asyncio.AbstractEventLoop,
+    out_q: "asyncio.Queue[Optional[dict]]",
+):
+    def gen_with_config(stop_flag: dict):
+        yield speech.StreamingRecognizeRequest(
+            streaming_config=make_streaming_config()
+        )
+        while True:
+            chunk = audio_q.get()
+            if chunk is None:
+                stop_flag["stop"] = True
+                break
+            yield speech.StreamingRecognizeRequest(audio_content=chunk)
+
+    def audio_only(stop_flag: dict):
+        while True:
+            chunk = audio_q.get()
+            if chunk is None:
+                stop_flag["stop"] = True
+                break
+            yield speech.StreamingRecognizeRequest(audio_content=chunk)
+
+    while True:
+        stop_flag = {"stop": False}
+        start = time.time()
+        try:
+            try:
+                responses = client.streaming_recognize(
+                    requests=gen_with_config(stop_flag)
+                )
+            except TypeError:
+                responses = client.streaming_recognize(
+                    make_streaming_config(), audio_only(stop_flag)
+                )
+
+            for resp in responses:
+                if not resp.results:
+                    if time.time() - start > MAX_STREAM_SECONDS:
+                        break
+                    continue
+                for result in resp.results:
+                    text = result.alternatives[0].transcript
+                    is_final = result.is_final
+
+                    asyncio.run_coroutine_threadsafe(
+                        out_q.put(
+                            {
+                                "source": source,
+                                "speaker": speaker,
+                                "speaker_name": speaker_name,
+                                "text": text,
+                                "final": is_final,
+                            }
+                        ),
+                        loop,
+                    )
+
+                    if (
+                        SUPABASE_ENABLED
+                        and session_id
+                        and is_final
+                        and text.strip()
+                    ):
+                        try:
+                            _append_transcript_line(
+                                session_id, speaker_name, text.strip()
+                            )
+                        except Exception as e:
+                            print(f"[stt:{source}] transcript append error: {e}")
+
+                if time.time() - start > MAX_STREAM_SECONDS:
+                    print("[stt] rotating stream to avoid 305s limit…")
+                    break
+
+        except Exception as e:
+            if "Audio Timeout Error" in str(e):
+                print("[stt] timeout; restarting stream…")
+                continue
+        finally:
+            if stop_flag["stop"]:
+                break
+
+    asyncio.run_coroutine_threadsafe(out_q.put(None), loop)
+
+
+async def result_sender(
+    websocket: WebSocket, out_q: "asyncio.Queue[Optional[dict]]", source: str
+):
+    while True:
+        item = await out_q.get()
+        if item is None:
+            break
+        try:
+            await websocket.send_text(json.dumps(item))
+        except Exception as e:
+            print(f"[ws:{source}] send error: {e}")
+            break
+
+def _recent_turns(session_id: str, limit: int = 2000) -> list[dict]:
+    """
+    Load the meeting transcript from Supabase and convert it into
+    pseudo-turns (speaker + text) using _parse_transcript_to_turns.
+    The 'limit' is a soft cap on number of characters; you can
+    adjust if you want.
+    """
+    mtg = _sb_get_meeting(session_id)
+    if not mtg:
+        return []
+
+    transcript = mtg.get("transcript") or ""
+    interviewer_name = mtg.get("interviewer_name") or ""
+    candidate_name = mtg.get("candidate_name") or ""
+
+    # If transcript is very long, truncate from the end (most recent lines)
+    if len(transcript) > limit:
+        # keep last `limit` chars
+        transcript = transcript[-limit:]
+
+    return _parse_transcript_to_turns(
+        transcript_text=transcript,
+        interviewer_name=interviewer_name,
+        candidate_name=candidate_name,
+    )
+
+# ─────────────────────────────────────────────
+# Summary payload coercer — ALWAYS return requested JSON shape
+# ─────────────────────────────────────────────
+def _coerce_summary_payload(model_out: Any) -> dict:
+    """
+    Normalizes the model output into the strict summary shape:
+
+    {
+      "analytics": {
+        "skills_match": int 0-10,
+        "communication_experience": int 0-10,
+        "jd_alignment": int 0-10,
+        "overall_score": int 0-10  # computed as average of the three above
+      },
+      "role_fit": "...",
+      "experience": "...",
+      "strengths": "...",
+      "weaknesses": "...",
+      "interview_summary": "..."
+    }
+    """
+    out = {
+        "analytics": {
+            "skills_match": 0,
+            "communication_experience": 0,
+            "jd_alignment": 0,
+            "overall_score": 0,
+        },
+        "role_fit": "uncertain",
+        "experience": "",
+        "strengths": "",
+        "weaknesses": "",
+        "interview_summary": "",
+    }
+
+    # If the model just sent a string, treat it as a generic interview summary
+    if isinstance(model_out, str):
+        out["interview_summary"] = model_out.strip()
+        return out
+
+    if not isinstance(model_out, dict):
+        return out
+
+    analytics = model_out.get("analytics") or {}
+
+    def _to_float(x, default=0.0):
+        try:
+            return float(x)
+        except Exception:
+            return default
+
+    def _clamp10(v: float) -> float:
+        v = float(v)
+        if v < 0:
+            v = 0.0
+        if v > 10:
+            v = 10.0
+        return v
+
+    # Pull scores (allowing for a few alternative names just in case)
+    skills_match = _to_float(analytics.get("skills_match"))
+    comm_exp = _to_float(
+        analytics.get("communication_experience")
+        or analytics.get("communication")
+        or analytics.get("communication_score")
+    )
+    jd_alignment = _to_float(
+        analytics.get("jd_alignment")
+        or analytics.get("jd_fit")
+        or analytics.get("role_fit_score")
+    )
+
+    skills_match = _clamp10(skills_match)
+    comm_exp = _clamp10(comm_exp)
+    jd_alignment = _clamp10(jd_alignment)
+
+    out["analytics"]["skills_match"] = int(round(skills_match))
+    out["analytics"]["communication_experience"] = int(round(comm_exp))
+    out["analytics"]["jd_alignment"] = int(round(jd_alignment))
+
+    # overall_score MUST be the average of the three, if we have any signal
+    scores = [skills_match, comm_exp, jd_alignment]
+    nonzero = [s for s in scores if s > 0]
+    if nonzero:
+        overall = sum(nonzero) / len(nonzero)
+    else:
+        # fall back to model's own overall_score if absolutely nothing else is set
+        overall = _clamp10(_to_float(analytics.get("overall_score"), 0.0))
+    out["analytics"]["overall_score"] = int(round(overall))
+
+    # role_fit: normalize into a small set of labels
+    role_fit = (model_out.get("role_fit") or "").strip().lower()
+    allowed_role_fits = {
+        "perfect fit",
+        "good fit",
+        "partial fit",
+        "uncertain",
+        "not a fit",
+    }
+    if role_fit not in allowed_role_fits:
+        # Try to infer roughly, otherwise keep "uncertain"
+        if "perfect" in role_fit:
+            role_fit = "perfect fit"
+        elif "good" in role_fit:
+            role_fit = "good fit"
+        elif "partial" in role_fit:
+            role_fit = "partial fit"
+        elif "not" in role_fit:
+            role_fit = "not a fit"
+        else:
+            role_fit = "uncertain"
+    out["role_fit"] = role_fit
+
+    # experience: just keep the text the model sends (e.g. fresher / mid level / senior)
+    out["experience"] = str(model_out.get("experience") or "").strip()
+
+    def _coerce_text(v: Any) -> str:
+        if isinstance(v, list):
+            return " ".join(str(x).strip() for x in v if str(x).strip())
+        return str(v or "").strip()
+
+    out["strengths"] = _coerce_text(model_out.get("strengths"))
+    out["weaknesses"] = _coerce_text(model_out.get("weaknesses"))
+    out["interview_summary"] = _coerce_text(model_out.get("interview_summary"))
+
+    return out
+# ─────────────────────────────────────────────
+# Interview feedback → numeric scores (0–10)
+# ─────────────────────────────────────────────
+
+_OVERALL_MAP = {
+    "STRONG_HIRE": 10,
+    "HIRE": 8,
+    "UNSURE": 5,
+    "DO_NOT_HIRE": 2,
+}
+
+_SKILLS_MAP = {
+    "LOW": 3,
+    "MEDIUM": 6,
+    "HIGH": 9,
+}
+
+_COMM_MAP = {
+    "NEEDS_WORK": 3,
+    "OKAY": 6,
+    "STRONG": 9,
+}
+
+_JD_FIT_MAP = {
+    "PERFECT": 10,
+    "GOOD": 8,
+    "PARTIAL": 5,
+    "UNCERTAIN": 3,
+}
+
+
+def compute_feedback_scores(body: InterviewFeedbackIn) -> Dict[str, int]:
+    """Map radio selections to consistent 0–10 scores."""
+    skills = _SKILLS_MAP[body.skills_level]
+    comm = _COMM_MAP[body.communication_level]
+    jd   = _JD_FIT_MAP[body.jd_fit_level]
+
+    # base from 3 dimensions
+    base_overall = round((skills + comm + jd) / 3)
+
+    # interviewer recommendation nudges overall
+    rec = _OVERALL_MAP[body.overall_recommendation]
+    overall = round(0.7 * base_overall + 0.3 * rec)
+
+    # clamp
+    overall = max(0, min(10, overall))
+
+    return {
+        "skills_score": skills,
+        "communication_score": comm,
+        "jd_fit_score": jd,
+        "overall_score": overall,
+    }
+
+def final_candidate_score(
+    jd_match: Optional[float],
+    feedback_overall: Optional[int],
+    ai_overall: Optional[int],
+) -> float:
+    """
+    Combine JD match (0–100) + feedback (0–10) + AI overall (0–10)
+    into one final score on 0–10 for ranking.
+    """
+    jd = (jd_match or 0.0) / 10.0  # normalize 0–10
+    fb = float(feedback_overall or 0)
+    ai = float(ai_overall or 0)
+
+    # weights: tweak as you like (must sum to 1)
+    score = 0.4 * jd + 0.4 * fb + 0.2 * ai
+    return round(score, 2)
+
+# ─────────────────────────────────────────────
+# Candidate answer extraction (transcript-only)
+# ─────────────────────────────────────────────
+def _norm(s: str) -> str:
+    s = s.lower().strip()
+    s = re.sub(r"[^a-z0-9\s]+", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def _is_interviewer(t: dict, interviewer_name: str) -> bool:
+    who = (t.get("speaker") or t.get("source") or "").lower()
+    name = (t.get("speaker_name") or "").lower()
+    if "interviewer" in who or "mic" in who:
+        return True
+    if interviewer_name and name and name == interviewer_name.lower():
+        return True
+    return False
+
+
+def _is_candidate(t: dict, candidate_name: str) -> bool:
+    who = (t.get("speaker") or t.get("source") or "").lower()
+    name = (t.get("speaker_name") or "").lower()
+    if "candidate" in who or "tab" in who:
+        return True
+    if candidate_name and name and name == candidate_name.lower():
+        return True
+    return False
+
+
+def _turns_snippet(turns: List[dict], last_n: int = 12) -> str:
+    ctx = turns[-last_n:] if len(turns) > last_n else turns[:]
+    lines = []
+    for t in ctx:
+        who = t.get("speaker_name") or t.get("speaker") or t.get("source", "unknown")
+        text = t.get("text", "")
+        lines.append(f"{who}: {text}")
+    return "\n".join(lines)
+
+
+def _extract_candidate_answer(
+    question_text: str,
+    turns: List[dict],
+    interviewer_name: str = "",
+    candidate_name: str = "",
+) -> str:
+    if not turns:
+        return ""
+
+    qn = _norm(question_text)
+    best_idx, best_score = None, 0.0
+    qtoks = set(qn.split())
+
+    # Find the interviewer turn that best matches the question
+    for i, t in enumerate(turns):
+        if not _is_interviewer(t, interviewer_name):
+            continue
+        tn = _norm(t.get("text", ""))
+        if not tn:
+            continue
+        ttoks = set(tn.split())
+        if not qtoks or not ttoks:
+            continue
+        overlap = len(qtoks & ttoks) / max(1, len(qtoks))
+        if qn in tn or tn in qn:
+            overlap = 1.0
+        if overlap > best_score:
+            best_score, best_idx = overlap, i
+
+    # Collect candidate's answer after that interviewer turn
+    if best_idx is not None:
+        out = []
+        for j in range(best_idx + 1, len(turns)):
+            t = turns[j]
+            if _is_interviewer(t, interviewer_name):
+                break
+            if _is_candidate(t, candidate_name):
+                out.append(t.get("text", ""))
+            if len(out) >= 6:
+                break
+        return " ".join(x.strip() for x in out if x.strip())
+
+    # Fallback: last few candidate turns
+    cand = [t.get("text", "") for t in turns[-10:] if _is_candidate(t, candidate_name)]
+    return " ".join(x.strip() for x in cand if x.strip())
 
 # ---------------------------------------------------------------------------
 # routes (YOUR ORIGINAL ROUTES — UNCHANGED)
@@ -1065,6 +1864,101 @@ async def list_recruiter_interviews_today(
         "date": day.isoformat(),
         "count": len(items),
         "interviews": items,
+    }
+
+@app.get("/recruiter/interviews/{interview_id}/overview")
+async def recruiter_interview_overview(
+    interview_id: str,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    """
+    Full 360° view for recruiter:
+    - interview basic info
+    - resume + JD scores
+    - interviewer feedback
+    - transcript + AI report (from meetings)
+    - recruiter note
+    """
+    # 1) Load interview
+    interview = _first_row(
+        supabase.table("interviews")
+        .select("*")
+        .eq("interview_id", interview_id)
+        .limit(1)
+        .execute()
+    )
+    if not interview:
+        raise HTTPException(404, "Interview not found")
+
+    # 2) Ensure recruiter owns this job
+    job = _get_job_owned(interview["job_id"], current_user)  # also returns the job row
+
+    # 3) Resume
+    resume = _first_row(
+        supabase.table("resumes")
+        .select(
+            "resume_id, candidate_id, full_name, email, phone, location, "
+            "ai_summary, jd_match_score, skill_match_score, experience_match_score, "
+            "education_match_score, raw_text, skills, experience, education, projects, certifications"
+        )
+        .eq("resume_id", interview["resume_id"])
+        .limit(1)
+        .execute()
+    )
+
+    # 4) Candidate profile (optional)
+    candidate = None
+    if resume and resume.get("candidate_id"):
+        candidate = _first_row(
+            supabase.table("candidates")
+            .select("candidate_id, first_name, last_name, full_name, email, phone, location, links")
+            .eq("candidate_id", resume["candidate_id"])
+            .limit(1)
+            .execute()
+        )
+
+    # 5) Interviewer feedback
+    feedback = _first_row(
+        supabase.table("interview_feedback")
+        .select("*")
+        .eq("interview_id", interview_id)
+        .limit(1)
+        .execute()
+    )
+
+    # 6) Transcript + AI report (meetings table uses meeting_id == interview_id)
+    meeting = _first_row(
+        supabase.table("meetings")
+        .select("transcript, ai_report")
+        .eq("meeting_id", interview_id)
+        .limit(1)
+        .execute()
+    ) or {}
+
+    return {
+        "interview": {
+            "interview_id": interview["interview_id"],
+            "status": interview.get("status"),
+            "start_at": interview.get("start_at"),
+            "end_at": interview.get("end_at"),
+            "meet_link": interview.get("google_meet_link"),
+            "calendar_link": interview.get("google_html_link"),
+            "feedback_overall_score": interview.get("feedback_overall_score"),
+            "recruiter_note": interview.get("recruiter_note"),
+        },
+        "job": {
+            "job_id": job["job_id"],
+            "role": job.get("role"),
+            "location": job.get("location"),
+            "employment_type": job.get("employment_type"),
+            "work_mode": job.get("work_mode"),
+            "jd_text": job.get("jd_text"),
+        },
+        "candidate": candidate,
+        "resume": resume,
+        "feedback": feedback,
+        "transcript": meeting.get("transcript"),
+        "ai_report": meeting.get("ai_report"),
     }
 
 # ---------- company ----------
@@ -1936,6 +2830,128 @@ async def ranked(job_id: str, limit: int = Query(50, ge=1, le=200), current_user
     )
     return {"job_id": job_id, "count": len(rows), "rows": rows}
 
+@app.get("/recruiter/jobs/{job_id}/candidates-ranked")
+async def recruiter_candidates_ranked(
+    job_id: str,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    """
+    For a given job, return ONLY candidates who have an interview with
+    status in {INTERVIEW_SCHEDULED, INTERVIEW_DONE, ABSENT}, ranked by
+    combined score: JD match + interviewer feedback + AI report.
+    """
+    # Ensure this recruiter owns the job
+    job = _get_job_owned(job_id, current_user)
+
+    # 1) All resumes for this job
+    resumes = (
+        supabase.table("resumes")
+        .select(
+            "resume_id, candidate_id, full_name, email, jd_match_score, "
+            "skill_match_score, experience_match_score"
+        )
+        .eq("job_id", job_id)
+        .execute()
+        .data
+        or []
+    )
+    if not resumes:
+        return {"job_id": job_id, "role": job.get("role"), "candidates": []}
+
+    resume_ids = [r["resume_id"] for r in resumes]
+
+    # Only consider these interview statuses
+    RANKABLE_STATUSES = ["INTERVIEW_SCHEDULED", "INTERVIEW_DONE", "ABSENT"]
+
+    # 2) Interviews for those resumes, filtered by status
+    interviews = (
+        supabase.table("interviews")
+        .select("interview_id, resume_id, status, feedback_overall_score")
+        .in_("resume_id", resume_ids)
+        .in_("status", RANKABLE_STATUSES)
+        .execute()
+        .data
+        or []
+    )
+    if not interviews:
+        # No interviews in the desired statuses
+        return {"job_id": job_id, "role": job.get("role"), "candidates": []}
+
+    interviews_by_resume = {i["resume_id"]: i for i in interviews}
+    interview_ids = [i["interview_id"] for i in interviews]
+
+    # 3) Feedback rows
+    feedback_rows = (
+        supabase.table("interview_feedback")
+        .select("interview_id, overall_score")
+        .in_("interview_id", interview_ids)
+        .execute()
+        .data
+        or []
+    )
+    fb_by_interview = {f["interview_id"]: f for f in feedback_rows}
+
+    # 4) AI reports
+    meetings = (
+        supabase.table("meetings")
+        .select("meeting_id, ai_report")
+        .in_("meeting_id", interview_ids)
+        .execute()
+        .data
+        or []
+    )
+    ai_by_meeting = {m["meeting_id"]: m for m in meetings}
+
+    items = []
+    for r in resumes:
+        it = interviews_by_resume.get(r["resume_id"])
+        if not it:
+            # This resume either has no interview OR only interviews with
+            # statuses outside RANKABLE_STATUSES -> skip it.
+            continue
+
+        fb_row = fb_by_interview.get(it["interview_id"])
+        feedback_overall = (
+            (fb_row or {}).get("overall_score")
+            or it.get("feedback_overall_score")
+        )
+
+        mt = ai_by_meeting.get(it["interview_id"])
+        ai_overall = None
+        if mt and mt.get("ai_report"):
+            ai_overall = (mt["ai_report"].get("analytics") or {}).get("overall_score")
+
+        final_score_val = final_candidate_score(
+            jd_match=r.get("jd_match_score"),
+            feedback_overall=feedback_overall,
+            ai_overall=ai_overall,
+        )
+
+        items.append(
+            {
+                "resume_id": r["resume_id"],
+                "candidate_id": r.get("candidate_id"),
+                "full_name": r.get("full_name"),
+                "email": r.get("email"),
+                "jd_match_score": r.get("jd_match_score"),
+                "feedback_overall_score": feedback_overall,
+                "ai_overall_score": ai_overall,
+                "interview_id": it["interview_id"],
+                "interview_status": it.get("status"),
+                "final_score": final_score_val,
+            }
+        )
+
+    # Sort best → worst
+    items.sort(key=lambda x: x["final_score"], reverse=True)
+
+    return {
+        "job_id": job_id,
+        "role": job.get("role"),
+        "count": len(items),
+        "candidates": items,
+    }
+
 @app.post("/jobs/{job_id}/rescore_existing")
 async def rescore_existing(job_id: str, current_user: UserIdentity = Depends(get_current_user)):
     job = _get_job_owned(job_id, current_user)
@@ -2318,7 +3334,6 @@ async def update_interviewer(
 
     # Supabase update returns a list
     return updated_rows[0] if updated_rows else existing
-
 
 @app.post("/interviewers/{interviewer_id}/deactivate")
 async def deactivate_interviewer(
@@ -2792,301 +3807,85 @@ async def get_interview_detail(
 
 # ===================== INTERVIEW COPILOT =====================
 
-@app.get("/copilot/interviews/{interview_id}/bootstrap")
-async def copilot_bootstrap(
-    interview_id: str,
-    current_user: UserIdentity = Depends(get_current_user),
-):
+# High-level instructions for the copilot behavior
+COPILOT_SYSTEM_HINT = """
+You are an AI interview copilot helping a human interviewer evaluate a candidate.
+Be concise, structured, and practical. Avoid over-explaining theory.
+Always bias towards concrete, scenario-based questions that reveal real experience.
+""".strip()
+
+
+def _meet_context_for_session(session_id: str) -> dict:
     """
-    Prepare full context for a live interview:
-    - Candidate summary
-    - JD summary
-    - Suggested interview flow
-    - Rubric
-    - Starter questions
+    Load meeting + transcript context for the AI copilot.
+    Returns: {meeting, turns, interviewer_name, candidate_name, jd, resume}
     """
-    ctx = _get_interview_context(interview_id, current_user)
-    job = ctx["job"]
-    resume = ctx["resume"]
-    meta = ctx["meta"]
-    must = ctx["must"]
-    nice = ctx["nice"]
-
-    job_role = job.get("role") or "Interview"
-    jd_text = job.get("jd_text") or ""
-    candidate_name = (
-        resume.get("full_name")
-        or resume.get("candidate_name")
-        or resume.get("email")
-    )
-    candidate_email = resume.get("email")
-
-    prompt = f"""
-You are an AI interview copilot assisting a human interviewer.
-
-Use the following context to prepare for the interview.
-
-JOB:
-- Title: {job_role}
-- Location: {job.get('location')}
-- Employment type: {job.get('employment_type')}
-- Work mode: {job.get('work_mode')}
-- Must-have skills: {', '.join(must or [])}
-- Nice-to-have skills: {', '.join(nice or [])}
-
-JOB DESCRIPTION:
-{jd_text[:4000]}
-
-CANDIDATE (from resume):
-- Name: {candidate_name}
-- Email: {candidate_email}
-- Location: {resume.get('location')}
-- Existing AI summary (if any): {(resume.get('ai_summary') or '')[:1500]}
-
-STRUCTURED RESUME FIELDS (truncated JSON):
-skills: {(json.dumps(resume.get('skills') or {}, ensure_ascii=False))[:1500]}
-experience: {(json.dumps((resume.get('experience') or [])[:5], ensure_ascii=False))[:2000]}
-education: {(json.dumps((resume.get('education') or [])[:3], ensure_ascii=False))[:800]}
-
-MATCH METRICS:
-- jd_match_score: {resume.get('jd_match_score')}
-- skill_match_score: {resume.get('skill_match_score')}
-- experience_match_score: {resume.get('experience_match_score')}
-- total_experience_years (if known): {meta.get('total_experience_years')}
-
-Return ONLY JSON with these exact top-level keys:
-- candidate_summary: string (Markdown, 3–5 bullet points with the strongest signals)
-- jd_summary: string (Markdown, 3–5 bullet points explaining what this role really needs)
-- suggested_flow: array of objects with keys:
-    - section: string (e.g. "Intro", "Deep dive in backend APIs")
-    - goal: string (what the interviewer should achieve in this section)
-    - minutes: integer (approx. time in minutes)
-- rubric: object mapping competency name to an object:
-    - what_good_looks_like: string
-    - scale: string describing 1–5 expectations
-- starter_questions: array of ~8 concrete, actionable interview questions tailored
-  to this role and candidate.
-
-Do not include any other keys.
-Do not include comments or extra text outside the JSON.
-    """.strip()
-
-    data = _ollama_json(prompt)
+    mtg = _sb_get_meeting(session_id) or {}
+    turns = _recent_turns(session_id, limit=2000)
 
     return {
-        "interview_id": interview_id,
-        "job": {
-            "role": job_role,
-            "location": job.get("location"),
-            "employment_type": job.get("employment_type"),
-            "work_mode": job.get("work_mode"),
-            "must_have": must,
-            "nice_to_have": nice,
-        },
-        "candidate": {
-            "name": candidate_name,
-            "email": candidate_email,
-            "location": resume.get("location"),
-        },
-        "copilot": data,
+        "meeting": mtg,
+        "turns": turns,
+        "interviewer_name": mtg.get("interviewer_name") or "Interviewer",
+        "candidate_name": mtg.get("candidate_name") or "Candidate",
+        "jd": mtg.get("jd") or "",
+        "resume": mtg.get("resume") or "",
     }
 
-
-@app.post("/copilot/interviews/{interview_id}/suggest-question")
-async def copilot_suggest_question(
+@app.post("/interviews/{interview_id}/feedback")
+async def submit_interview_feedback(
     interview_id: str,
-    body: CopilotQuestionIn,
+    body: InterviewFeedbackIn,
     current_user: UserIdentity = Depends(get_current_user),
 ):
     """
-    Suggest the next question to ask, given:
-    - JD + resume context
-    - Optional transcript so far
-    - Optional focus area
+    Called by the interviewer after the interview.
+    Stores raw choices + numeric scores in interview_feedback,
+    and updates interviews.feedback_overall_score for ranking.
     """
+    # 1) Ensure this auth user is the assigned interviewer
     ctx = _get_interview_context(interview_id, current_user)
-    job = ctx["job"]
-    resume = ctx["resume"]
-    must = ctx["must"]
-    nice = ctx["nice"]
+    interviewer = ctx["interviewer"]
+    interviewer_id = interviewer["interviewer_id"]
 
-    job_role = job.get("role") or "Interview"
-    jd_text = job.get("jd_text") or ""
-    candidate_name = (
-        resume.get("full_name")
-        or resume.get("candidate_name")
-        or resume.get("email")
+    # 2) Compute scores 0–10
+    scores = compute_feedback_scores(body)
+
+    # 3) Upsert feedback row
+    row = {
+        "interview_id": interview_id,
+        "interviewer_id": interviewer_id,
+        "overall_recommendation": body.overall_recommendation,
+        "skills_level": body.skills_level,
+        "communication_level": body.communication_level,
+        "jd_fit_level": body.jd_fit_level,
+        "flags": body.flags,
+        "comment": body.comment,
+        "skills_score": scores["skills_score"],
+        "communication_score": scores["communication_score"],
+        "jd_fit_score": scores["jd_fit_score"],
+        "overall_score": scores["overall_score"],
+    }
+
+    fb = (
+        supabase.table("interview_feedback")
+        .upsert(row, on_conflict="interview_id,interviewer_id")
+        .execute()
+        .data[0]
     )
 
-    transcript = (body.transcript_so_far or "").strip()
-    focus = (body.focus or "").strip()
-
-    prompt = f"""
-You are an AI interview copilot helping a human interviewer decide the NEXT question.
-
-CONTEXT:
-- Role: {job_role}
-- Must-have skills: {', '.join(must or [])}
-- Nice-to-have skills: {', '.join(nice or [])}
-
-JOB DESCRIPTION (truncated):
-{jd_text[:2000]}
-
-CANDIDATE:
-- Name: {candidate_name}
-- Email: {resume.get('email')}
-- Location: {resume.get('location')}
-
-STRUCTURED RESUME (truncated JSON):
-skills: {(json.dumps(resume.get('skills') or {}, ensure_ascii=False))[:1200]}
-experience: {(json.dumps((resume.get('experience') or [])[:5], ensure_ascii=False))[:1800]}
-
-TRANSCRIPT SO FAR:
-{transcript if transcript else "(no transcript provided)"}
-
-FOCUS AREA (if any):
-{focus if focus else "(none specified)"}
-
-Return ONLY JSON with these exact top-level keys:
-- question: string, the next question to ask (clear, concise, and specific)
-- type: string, one of ["behavioral", "technical", "system_design", "communication", "culture"]
-- rationale: short string explaining why this is a good next question
-- follow_ups: array of 2–4 short follow-up questions the interviewer can use
-
-No extra keys and no extra text outside the JSON.
-    """.strip()
-
-    data = _ollama_json(prompt)
-    return {
-        "interview_id": interview_id,
-        "suggestion": data,
-    }
-
-
-@app.post("/copilot/interviews/{interview_id}/summarize-answer")
-async def copilot_summarize_answer(
-    interview_id: str,
-    body: CopilotAnswerIn,
-    current_user: UserIdentity = Depends(get_current_user),
-):
-    """
-    Summarize a single answer into:
-    - Bullet notes
-    - Score hints per dimension
-    - Risk flags & suggested follow-ups
-    """
-    ctx = _get_interview_context(interview_id, current_user)
-    job = ctx["job"]
-    resume = ctx["resume"]
-
-    job_role = job.get("role") or "Interview"
-    dim = (body.dimension or "").strip()
-
-    prompt = f"""
-You are an AI note-taking assistant for a technical interview.
-
-JOB ROLE: {job_role}
-
-CANDIDATE:
-- Name: {resume.get('full_name') or resume.get('email')}
-- Email: {resume.get('email')}
-
-QUESTION ASKED:
-{body.question}
-
-CANDIDATE ANSWER (verbatim):
-{body.raw_answer}
-
-DIMENSION (if provided) indicates which competency this question targets, e.g.
-"problem_solving", "system_design", "communication", "culture", "leadership".
-Dimension provided: {dim if dim else "(none specified, infer from the content if possible)"}
-
-Return ONLY JSON with these exact top-level keys:
-- notes_markdown: string (3–8 bullet points in Markdown capturing key facts, signals, and examples)
-- scores: object mapping dimension name (e.g. "problem_solving") to an integer 1–5
-- risk_flags: array of short strings describing any concerns or red flags; empty array if none
-- follow_up_suggestions: array of 2–4 follow-up questions the interviewer could ask next
-
-No extra keys, no comments, and no text outside the JSON.
-    """.strip()
-
-    data = _ollama_json(prompt)
-    return {
-        "interview_id": interview_id,
-        "analysis": data,
-    }
-
-
-@app.post("/copilot/interviews/{interview_id}/final-report")
-async def copilot_final_report(
-    interview_id: str,
-    body: CopilotFinalIn,
-    current_user: UserIdentity = Depends(get_current_user),
-):
-    """
-    Generate a concise final report after the interview:
-    - Overall summary
-    - Strengths / weaknesses
-    - Risk flags
-    - Recommended decision
-    """
-    ctx = _get_interview_context(interview_id, current_user)
-    job = ctx["job"]
-    resume = ctx["resume"]
-
-    job_role = job.get("role") or "Interview"
-    notes = (body.notes or "").strip()
-    decision = (body.decision or "").strip()
-    ratings = body.ratings or {}
-
-    prompt = f"""
-You are an AI assistant helping an interviewer write a final evaluation.
-
-JOB:
-- Role: {job_role}
-- Location: {job.get('location')}
-- Employment type: {job.get('employment_type')}
-- Work mode: {job.get('work_mode')}
-
-CANDIDATE:
-- Name: {resume.get('full_name') or resume.get('email')}
-- Email: {resume.get('email')}
-- Location: {resume.get('location')}
-
-MATCH METRICS:
-- jd_match_score: {resume.get('jd_match_score')}
-- skill_match_score: {resume.get('skill_match_score')}
-- experience_match_score: {resume.get('experience_match_score')}
-
-EXISTING AI RESUME SUMMARY (if any):
-{(resume.get('ai_summary') or '')[:1500]}
-
-INTERVIEWER NOTES (raw text, may be messy):
-{notes if notes else "(no extra notes provided)"}
-
-INTERVIEWER DECISION (if provided):
-{decision if decision else "(no explicit decision yet)"}
-
-INTERVIEWER RATINGS (JSON, if provided):
-{json.dumps(ratings, ensure_ascii=False)}
-
-Return ONLY JSON with these exact top-level keys:
-- summary_markdown: short Markdown summary (max ~250 words) with clear sections:
-    - "Overall impression"
-    - "Strengths"
-    - "Concerns"
-- recommended_decision: one of ["strong_hire", "hire", "no_hire", "unsure"]
-- justification: 2–4 bullet points explaining the recommendation
-- coaching_for_next_round: 2–5 bullet points suggesting what next-round interviewers should focus on
-
-No extra keys and no text outside the JSON.
-    """.strip()
-
-    data = _ollama_json(prompt)
+    # 4) Also store overall_score on interviews row for quick sort
+    try:
+        supabase.table("interviews").update(
+            {"feedback_overall_score": scores["overall_score"]}
+        ).eq("interview_id", interview_id).execute()
+    except Exception as e:
+        print("[feedback] failed to update interviews.feedback_overall_score:", e)
 
     return {
         "interview_id": interview_id,
-        "final_report": data,
+        "feedback": fb,
+        "scores": scores,
     }
 
 @app.post("/jobs/{job_id}/resumes/shortlist")
@@ -3378,6 +4177,722 @@ async def update_interview_status(interview_id: str, body: InterviewStatusIn,
     if not row:
         raise HTTPException(404, "Interview not found")
     return {"interview_id": interview_id, "status": body.status}
+
+@app.post("/recruiter/interviews/{interview_id}/decision")
+async def recruiter_set_decision(
+    interview_id: str,
+    body: RecruiterDecisionIn,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    """
+    Recruiter sets final/next-step decision for an interview.
+    Allowed statuses: REVIEW, HIRED, REJECTED, SELECTED.
+    Also stores recruiter_note.
+    """
+    # 1) Fetch interview
+    interview = _first_row(
+        supabase.table("interviews")
+        .select("interview_id, job_id, status, recruiter_note")
+        .eq("interview_id", interview_id)
+        .limit(1)
+        .execute()
+    )
+    if not interview:
+        raise HTTPException(404, "Interview not found")
+
+    # 2) Ensure this recruiter owns the job
+    _ = _get_job_owned(interview["job_id"], current_user)
+
+    # 3) Update interview status + note
+    update_data: Dict[str, Any] = {"status": body.status}
+    if body.note is not None:
+        update_data["recruiter_note"] = body.note
+
+    updated = (
+        supabase.table("interviews")
+        .update(update_data)
+        .eq("interview_id", interview_id)
+        .execute()
+        .data
+    )
+    if not updated:
+        raise HTTPException(404, "Interview not found after update")
+
+    return {
+        "interview_id": interview_id,
+        "status": body.status,
+        "recruiter_note": body.note,
+    }
+
+# ─────────────────────────────────────────────
+# MeetAI session endpoints (reuse same DB)
+# ─────────────────────────────────────────────
+
+@app.post("/session/start")
+async def meet_session_start(payload: dict):
+    meeting_id = payload.get("meeting_id")
+    if not meeting_id:
+        raise HTTPException(400, "meeting_id required")
+    if not SUPABASE_ENABLED:
+        raise HTTPException(
+            500,
+            "Supabase not configured on server (.env missing SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY)",
+        )
+
+    row: dict = {"meeting_id": meeting_id}
+    for k in ("jd", "resume", "interviewer_name", "candidate_name"):
+        v = payload.get(k)
+        if v is not None:
+            row[k] = v
+
+    supabase.table("meetings").upsert(row, on_conflict="meeting_id").execute()
+    return {"session_id": meeting_id}
+
+# ADD NEAR OTHER IMPORTS
+from fastapi import Body
+
+@app.post("/meet/session/bootstrap")
+async def meet_session_bootstrap(
+    payload: Dict[str, str] = Body(...),
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    """
+    Create / upsert a MeetAI 'session' (meetings row) using ONLY interview_id.
+    This means the interviewer never has to type JD, resume text, candidate name, etc.
+    
+    Frontend will:
+      1) Call this endpoint with { "interview_id": "..." }
+      2) Receive: { session_id, meeting_id, candidate_name, interviewer_name, jd, resume }
+      3) Use session_id/meeting_id when connecting to MeetAI WebSocket or /ai endpoints.
+    """
+    interview_id = (payload or {}).get("interview_id")
+    if not interview_id:
+        raise HTTPException(400, "interview_id required")
+
+    # Use your existing helper: verifies interviewer owns this interview
+    ctx = _get_interview_context(interview_id, current_user)
+    job = ctx["job"]
+    resume = ctx["resume"]
+    interviewer = ctx["interviewer"]
+
+    # Build the values MeetAI expects
+    meeting_id = interview_id  # <-- use interview_id as session/meeting id
+    jd_text = job.get("jd_text") or ""
+    resume_text = resume.get("raw_text") or ""
+    candidate_name = (
+        resume.get("full_name")
+        or resume.get("candidate_name")
+        or resume.get("email")
+        or "Candidate"
+    )
+    interviewer_name = interviewer.get("name") or interviewer.get("email") or "Interviewer"
+
+    # We are reusing the same Supabase client as everywhere else
+    # Upsert into 'meetings' table used by MeetAI:
+    row = {
+        "meeting_id": meeting_id,
+        "jd": jd_text,
+        "resume": resume_text,
+        "interviewer_name": interviewer_name,
+        "candidate_name": candidate_name,
+    }
+
+    # NOTE: uses same table/shape as meetai.py's start_session()
+    supabase.table("meetings").upsert(row, on_conflict="meeting_id").execute()
+
+    return {
+        "session_id": meeting_id,
+        "meeting_id": meeting_id,
+        "candidate_name": candidate_name,
+        "interviewer_name": interviewer_name,
+        "jd": jd_text,
+        "resume": resume_text,
+    }
+
+@app.get("/session/{session_id}/turns")
+async def meet_get_turns(session_id: str):
+    mtg = _sb_get_meeting(session_id)
+    pseudo = _parse_transcript_to_turns(
+        mtg.get("transcript") or "",
+        mtg.get("interviewer_name") or "",
+        mtg.get("candidate_name") or "",
+    )
+    return {"session_id": session_id, "turns": pseudo}
+
+# ─────────────────────────────────────────────
+# WebSocket STT
+# ─────────────────────────────────────────────
+@app.websocket("/ws/{source}")
+async def websocket_stt(websocket: WebSocket, source: str):
+    if source not in ("mic", "tab"):
+        await websocket.close(code=1008)
+        return
+    await websocket.accept()
+    qp = websocket.query_params
+    session_id = qp.get("session_id")
+    speaker = qp.get("speaker") or ("interviewer" if source == "mic" else "candidate")
+    speaker_name = qp.get("speaker_name") or speaker
+
+    print(
+        f"[ws:{source}] connected (session={session_id}, speaker={speaker}, name={speaker_name})"
+    )
+
+    try:
+        stt_client = get_speech_client()
+    except Exception as e:
+        print(f"[stt-init] error: {e}")
+        await websocket.close()
+        return
+
+    audio_q: "queue.Queue[Optional[bytes]]" = queue.Queue()
+    out_q: "asyncio.Queue[Optional[dict]]" = asyncio.Queue()
+
+    worker = threading.Thread(
+        target=google_stt_worker,
+        args=(
+            source,
+            session_id,
+            speaker,
+            speaker_name,
+            stt_client,
+            audio_q,
+            asyncio.get_running_loop(),
+            out_q,
+        ),
+        daemon=True,
+    )
+    worker.start()
+
+    sender_task = asyncio.create_task(result_sender(websocket, out_q, source))
+
+    try:
+        while True:
+            try:
+                msg = await websocket.receive()
+            except WebSocketDisconnect:
+                print(f"[ws:{source}] disconnected")
+                break
+            except RuntimeError as e:
+                if "disconnect message has been received" in str(e).lower():
+                    print(f"[ws:{source}] disconnect acknowledged")
+                    break
+                raise
+            if msg.get("bytes") is not None:
+                audio_q.put(msg["bytes"])  # PCM16 bytes
+    finally:
+        audio_q.put(None)
+        try:
+            await asyncio.wait_for(sender_task, timeout=2)
+        except asyncio.TimeoutError:
+            sender_task.cancel()
+        print(f"[ws:{source}] done")
+
+@app.post("/ai/summary")
+async def ai_summary(payload: Dict[str, str] = Body(...)):
+    session_id = (payload or {}).get("session_id")
+    if not session_id:
+        raise HTTPException(400, "session_id required")
+
+    meeting = _sb_get_meeting(session_id)
+    turns = _recent_turns(session_id, limit=2000)
+    resume = meeting.get("resume", "")
+    jd = meeting.get("jd", "")
+
+    lines = [
+        f"{(t.get('speaker_name') or t.get('speaker') or t.get('source'))}: {t.get('text','')}"
+        for t in turns
+    ]
+    convo = "\n".join(lines)
+
+    prompt = f"""
+You are helping a recruiter. Return STRICT JSON ONLY with exactly these keys:
+
+analytics: object with:
+  - skills_match: integer 0–10
+      How well the candidate's REAL skills (from RESUME and what they actually said in the interview(according to the transcript)) match the JD.
+      Do NOT invent skills or experience that are not supported by the resume or transcript.
+  - communication_experience: integer 0–10
+      How clearly the candidate communicates according to the questions asked by the interviewer.
+      If the candidate ahs not responded to the question or no proper conversation went then score 1 .
+  - jd_alignment: integer 0–10
+      How well the RESUME + spoken answers align with the responsibilities and requirements in the JD.
+  - overall_score: integer 0–10
+      Your estimate of overall fit. (The server will recompute this as the average of the first three scores.)
+
+role_fit: one of
+  "perfect fit", "good fit", "partial fit", "uncertain", "not a fit"
+
+experience:
+  A short label such as "fresher", "mid level", or "senior", based mainly on RESUME (years/roles) and then interview.
+
+strengths:(write in bullet points)
+  A short, neutral 5-6 line paragraph describing the key strengths shown in the RESUME and INTERVIEW.
+  Focus on real evidence from their background and what they actually said.
+
+weaknesses:(write in bullet points)
+  A short, constructive 5–6 line paragraph about growth areas.
+  Never be rude or harsh. If information is limited, say that evaluation is limited instead of criticizing.
+  If the candidate does not gave any answer or has not responded to the question then mention it. 
+
+interview_summary:(write in bullet points)
+  A short, neutral 5–6 line paragraph summarizing how the interview went:
+  level of detail in answers, confidence vs confusion, and overall impression.
+  Do NOT assume things that were never said.
+
+IMPORTANT RULES:
+- Use RESUME and FULL TRANSCRIPT as the single source of truth about the candidate.
+- Use the JD only to judge relevance and alignment, NOT to fabricate missing skills.
+- If the candidate spoke very little or gave almost no answers (e.g. mostly interviewer talking, or very short replies),
+  then keep all analytics scores low (e.g. between 1 and 3) and clearly mention that the assessment is limited by lack of data.
+- Do not over-penalize nervousness or minor pauses; focus on the quality and clarity of whatever the candidate actually explained.
+- Be professional, supportive, and non-decisive. The recruiter makes the final decision, you are only assisting.
+- Output JSON only. Do not include any extra text or explanations.
+- If there is very limited conversation happened like (hi , hello , am i audible) , then do write that in the Interview summary and weaknessess.
+- Do not give "\\n" in responses.
+
+RESUME:
+{resume}
+
+JD:
+{jd}
+
+FULL TRANSCRIPT:
+{convo}
+""".strip()
+
+    data = _ollama_chat_json(prompt)
+    coerced = _coerce_summary_payload(data)
+
+    try:
+        _sb_upsert_ai_report(session_id, coerced)
+    except Exception as e:
+        print(f"[ai_summary] store report error: {e}")
+
+    return {"session_id": session_id, **coerced}
+
+@app.post("/ai/expected")
+async def ai_expected(payload: Dict[str, str] = Body(...)):
+    session_id = (payload or {}).get("session_id")
+    question = (payload or {}).get("question", "").strip()
+    if not session_id or not question:
+        raise HTTPException(400, "session_id and question required")
+
+    meeting = _sb_get_meeting(session_id)
+    resume = meeting.get("resume", "")
+    jd = meeting.get("jd", "")
+    turns = _recent_turns(session_id, 80)
+    convo = _turns_snippet(turns, 12)
+
+    prompt = f"""
+You are generating an example answer to help THIS candidate improve.
+Return STRICT JSON with exactly one key: expected_answer.
+
+Rules:
+- Use RESUME and RECENT TRANSCRIPT as the SINGLE source of truth about the candidate's background and skills.
+- Do NOT invent technical skills, tools, projects, or years of experience that are not clearly present in the RESUME or mentioned by the candidate.
+- Use the JD only to decide what to emphasize and how to structure the answer, but keep the content honest and realistic for THIS candidate.
+- If the JD asks for skills that the candidate does not have, you may:
+    • Mention genuine interest in learning those areas, OR
+    • Highlight transferable skills from their real experience,
+  but you MUST NOT pretend they already have that experience.
+- The answer should work for both technical and non-technical candidates:
+    use simple, clear language, and avoid heavy jargon.
+- Be supportive and neutral; do not sound judgmental.
+
+Context:
+RESUME:
+{resume}
+
+JD:
+{jd}
+
+RECENT TRANSCRIPT:
+{convo}
+
+QUESTION TO PREPARE EXPECTED ANSWER FOR:
+{question}
+
+Write a concise but complete expected_answer (bullets or short paragraphs)
+that THIS candidate could realistically say based on their real background.
+""".strip()
+
+    data = _ollama_chat_json(prompt)
+    exp_raw = (data.get("expected_answer") or data.get("raw") or "").strip()
+    return {
+        "session_id": session_id,
+        "question": question,
+        "expected_answer": _to_bullets(exp_raw, max_items=6),
+    }
+
+@app.post("/ai/validate")
+async def ai_validate(payload: Dict[str, str] = Body(...)):
+    session_id = (payload or {}).get("session_id")
+    question = (payload or {}).get("question", "").strip()
+    if not session_id or not question:
+        raise HTTPException(400, "session_id and question required")
+
+    meeting = _sb_get_meeting(session_id)
+    resume = meeting.get("resume", "")
+    jd = meeting.get("jd", "")
+    turns = _recent_turns(session_id, 300)
+
+    cand_answer = _extract_candidate_answer(
+        question,
+        turns,
+        interviewer_name=(meeting.get("interviewer_name") or ""),
+        candidate_name=(meeting.get("candidate_name") or ""),
+    )
+
+    prompt = f"""
+You are evaluating a candidate's answer to an interview question.
+Return STRICT JSON with keys:
+- verdict (one of: "STRONG", "OK", "LIMITED")
+- score (0.0–1.0)
+- explanation (1–3 short sentences)
+- expected_answer
+- candidate_answer
+
+Use:
+RESUME:
+{resume}
+
+JD:
+{jd}
+
+QUESTION:
+{question}
+
+CANDIDATE_ANSWER:
+{cand_answer if cand_answer else "(none)"} 
+
+GUIDELINES:
+
+1) EXPECTED ANSWER:
+   - First infer a good expected_answer using JD + RESUME.
+   - Do NOT invent skills, tools, or experience that contradicts the RESUME.
+   - The expected_answer should be realistic for THIS candidate's background.
+   - Write complete response ,Do NOT write incomplete response. 
+
+2) VERDICT:
+   - "STRONG": Candidate answer is largely correct, relevant, and aligned with the expected_answer.
+   - "OK": Candidate answer is partially correct or high-level, but missing important details OR not very structured.
+   - "LIMITED": Candidate answer is very short, off-topic, clearly incorrect, or contradicts the resume/JD.
+
+   VERY IMPORTANT:
+   - For broad questions like "Tell me about yourself" / "Introduce yourself" / "Walk me through your profile":
+     • If the answer is generally consistent with the resume and JD (even if brief), use at least "OK", not "LIMITED".
+     • Do NOT mark an answer as bad just because it doesn't repeat every project or metric from the resume.
+     • Minor differences in phrasing or missing achievements are acceptable.
+
+3) SCORE:
+   - score is a float between 0.0 and 1.0.
+   - Rough guideline:
+     • STRONG  → score between 0.7 and 1.0
+     • OK      → score between 0.4 and 0.7
+     • LIMITED → score between 0.0 and 0.4
+
+4) TONE:
+   - Be neutral, kind, and constructive.
+   - In the explanation, focus on what was good and what could be improved.
+   - Avoid harsh language like "wrong", "terrible", or personal judgments.
+
+Return ONLY the JSON object, with no extra commentary.
+""".strip()
+
+    data = _ollama_chat_json(prompt)
+
+    # Softer verdict labels
+    verdict = (data.get("verdict") or "").upper().strip()
+    allowed_verdicts = {"STRONG", "OK", "LIMITED"}
+    if verdict not in allowed_verdicts:
+        # Fallback: if there is no candidate answer at all, LIMITED; otherwise OK
+        verdict = "LIMITED" if not cand_answer else "OK"
+
+    try:
+        score = float(data.get("score", 0.0))
+    except Exception:
+        score = 0.0
+    # Clamp score into [0.0, 1.0]
+    score = max(0.0, min(1.0, score))
+    score_pct = int(round(score * 100))
+
+    exp_raw = (data.get("expected_answer") or data.get("raw") or "").strip()
+    explanation_raw = (data.get("explanation") or data.get("raw") or "").strip()
+
+    return {
+        "session_id": session_id,
+        "question": question,
+        "expected_answer": _to_bullets(exp_raw, max_items=6),
+        "candidate_answer": cand_answer,
+        "verdict": verdict,          # STRONG / OK / LIMITED
+        "score": score,
+        "score_pct": score_pct,
+        "explanation": _to_bullets(explanation_raw, max_items=3, max_len=160),
+    }
+
+@app.post("/ai/questions")
+async def ai_questions(payload: Dict[str, Any] = Body(...)):
+    session_id = (payload or {}).get("session_id")
+    count = int((payload or {}).get("count", 5))
+    if not session_id:
+        raise HTTPException(400, "session_id required")
+
+    meeting = _sb_get_meeting(session_id)
+    resume = meeting.get("resume", "")
+    jd = meeting.get("jd", "")
+    turns = _recent_turns(session_id, 60)
+    convo = _turns_snippet(turns, 10)
+
+    prompt = f"""
+Return STRICT JSON with key: questions (array of {count} concise follow-up questions).
+Use JD and Resume as primary guidance; if transcript context exists, adapt to it; otherwise generate from JD/Resume only.
+Keep tone neutral and helpful.
+
+RESUME:
+{resume}
+
+JD:
+{jd}
+
+RECENT TRANSCRIPT:
+{convo if convo.strip() else "(none)"}
+""".strip()
+
+    data = _ollama_chat_json(prompt, temperature=0.6)
+    questions = data.get("questions")
+    if not isinstance(questions, list):
+        raw = (data.get("raw") or "").strip()
+        questions = [x.strip("-• ").strip() for x in raw.split("\n") if x.strip()]
+    questions = [q for q in questions if q][:count]
+    return {"session_id": session_id, "questions": questions}
+
+@app.post("/recruiter/interviews/{interview_id}/email/hired")
+async def send_hired_email(
+    interview_id: str,
+    body: HiredEmailIn,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    ctx = _get_recruiter_interview_context(interview_id, current_user)
+    interview, job, resume, company = ctx["interview"], ctx["job"], ctx["resume"], ctx["company"]
+
+    # Idempotency: if already sent, just return
+    if interview.get("hired_email_sent_at"):
+        return {
+            "interview_id": interview_id,
+            "already_sent": True,
+        }
+
+    candidate_email = (resume or {}).get("email") or interview.get("candidate_email")
+    candidate_name = (resume or {}).get("full_name")
+    role = job.get("role") or "Position"
+    company_name = (company or {}).get("company_name") or "our company"
+
+    description = _hired_email_body(
+        candidate_name=candidate_name,
+        role=role,
+        company_name=company_name,
+        start_iso=body.start_iso,
+        location=body.location,
+    )
+
+    try:
+        svc = _google_service_for_user(current_user.user_id)
+    except HTTPException:
+        # bubble up our own HTTPException
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Google connection failed: {e}")
+
+    event = {
+        "summary": f"Offer Confirmation — {role} at {company_name}",
+        "location": body.location,
+        "start": {"dateTime": body.start_iso, "timeZone": body.timezone},
+        "end":   {"dateTime": body.end_iso,   "timeZone": body.timezone},
+        "attendees": [
+            {"email": candidate_email},
+            {"email": current_user.email},
+        ],
+        "description": description,
+    }
+
+    try:
+        created = svc.events().insert(
+            calendarId="primary",
+            body=event,
+            sendUpdates="all",
+        ).execute()
+    except Exception as e:
+        raise HTTPException(502, f"Failed to create calendar event: {e}")
+
+    # Mark as sent + optionally bump status to HIRED
+    now_iso = datetime.datetime.utcnow().isoformat() + "Z"
+    supabase.table("interviews").update(
+        {
+            "hired_email_sent_at": now_iso,
+            "status": "HIRED",
+        }
+    ).eq("interview_id", interview_id).execute()
+
+    return {
+        "interview_id": interview_id,
+        "status": "HIRED",
+        "already_sent": False,
+        "calendar_link": created.get("htmlLink"),
+    }
+
+@app.post("/recruiter/interviews/{interview_id}/email/rejected")
+async def send_rejected_email(
+    interview_id: str,
+    body: RejectEmailIn,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    ctx = _get_recruiter_interview_context(interview_id, current_user)
+    interview, job, resume, company = ctx["interview"], ctx["job"], ctx["resume"], ctx["company"]
+
+    if interview.get("rejected_email_sent_at"):
+        return {
+            "interview_id": interview_id,
+            "already_sent": True,
+        }
+
+    candidate_email = (resume or {}).get("email") or interview.get("candidate_email")
+    candidate_name = (resume or {}).get("full_name")
+    role = job.get("role") or "Position"
+    company_name = (company or {}).get("company_name") or "our company"
+
+    desc = _rejected_email_body(
+        candidate_name=candidate_name,
+        role=role,
+        company_name=company_name,
+    )
+
+    # All-day event date
+    if body.date:
+        date_str = body.date
+    else:
+        date_str = datetime.date.today().isoformat()
+
+    try:
+        svc = _google_service_for_user(current_user.user_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Google connection failed: {e}")
+
+    # All-day event uses 'date' instead of 'dateTime'
+    event = {
+        "summary": f"Application decision — {role} at {company_name}",
+        "start": {"date": date_str},
+        "end": {"date": date_str},
+        "attendees": [
+            {"email": candidate_email},
+            {"email": current_user.email},
+        ],
+        "description": desc,
+    }
+
+    try:
+        created = svc.events().insert(
+            calendarId="primary",
+            body=event,
+            sendUpdates="all",
+        ).execute()
+    except Exception as e:
+        raise HTTPException(502, f"Failed to create calendar event: {e}")
+
+    now_iso = datetime.datetime.utcnow().isoformat() + "Z"
+    supabase.table("interviews").update(
+        {
+            "rejected_email_sent_at": now_iso,
+            "status": "REJECTED",
+        }
+    ).eq("interview_id", interview_id).execute()
+
+    return {
+        "interview_id": interview_id,
+        "status": "REJECTED",
+        "already_sent": False,
+        "calendar_link": created.get("htmlLink"),
+    }
+
+@app.post("/recruiter/interviews/{interview_id}/email/assignment")
+async def send_assignment_email(
+    interview_id: str,
+    body: AssignmentEmailIn,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    ctx = _get_recruiter_interview_context(interview_id, current_user)
+    interview, job, resume, company = ctx["interview"], ctx["job"], ctx["resume"], ctx["company"]
+
+    if interview.get("assignment_email_sent_at"):
+        return {
+            "interview_id": interview_id,
+            "already_sent": True,
+        }
+
+    candidate_email = (resume or {}).get("email") or interview.get("candidate_email")
+    candidate_name = (resume or {}).get("full_name")
+    role = job.get("role") or "Position"
+    company_name = (company or {}).get("company_name") or "our company"
+
+    desc = _assignment_email_body(
+        candidate_name=candidate_name,
+        role=role,
+        company_name=company_name,
+        deadline_iso=body.deadline_iso,
+        link=body.link,
+        description=body.description,
+    )
+
+    try:
+        svc = _google_service_for_user(current_user.user_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"Google connection failed: {e}")
+
+    # Make event 30 minutes long ending at deadline
+    try:
+        dt_deadline = datetime.datetime.fromisoformat(body.deadline_iso.replace("Z", "+00:00"))
+    except Exception:
+        raise HTTPException(400, "Invalid deadline_iso format")
+
+    end_dt = dt_deadline + datetime.timedelta(minutes=30)
+    end_iso = end_dt.isoformat()
+
+    event = {
+        "summary": f"Assignment for {role} — {company_name}",
+        "start": {"dateTime": body.deadline_iso, "timeZone": body.timezone},
+        "end":   {"dateTime": end_iso,          "timeZone": body.timezone},
+        "attendees": [
+            {"email": candidate_email},
+            {"email": current_user.email},
+        ],
+        "description": desc,
+    }
+
+    try:
+        created = svc.events().insert(
+            calendarId="primary",
+            body=event,
+            sendUpdates="all",
+        ).execute()
+    except Exception as e:
+        raise HTTPException(502, f"Failed to create calendar event: {e}")
+
+    now_iso = datetime.datetime.utcnow().isoformat() + "Z"
+    supabase.table("interviews").update(
+        {
+            "assignment_email_sent_at": now_iso,
+        }
+    ).eq("interview_id", interview_id).execute()
+
+    return {
+        "interview_id": interview_id,
+        "already_sent": False,
+        "calendar_link": created.get("htmlLink"),
+    }
+
 # ---------------------------------------------------------------------------
 # run (local)
 # ---------------------------------------------------------------------------
