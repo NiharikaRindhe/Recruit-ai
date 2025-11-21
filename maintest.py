@@ -1129,7 +1129,6 @@ def _ollama_chat_json(prompt: str, temperature: float = 0.2) -> dict:
 # ─────────────────────────────────────────────
 _CODE_FENCE = re.compile(r"```.*?```", flags=re.S)
 
-
 def _strip_code_and_json(s: str) -> str:
     if not s:
         return ""
@@ -1146,7 +1145,6 @@ def _strip_code_and_json(s: str) -> str:
         except Exception:
             s = ""
     return s.strip()
-
 
 def _to_bullets(s: str, max_items: int = 6, max_len: int = 180) -> str:
     s = _strip_code_and_json(s)
@@ -1169,7 +1167,6 @@ def _to_bullets(s: str, max_items: int = 6, max_len: int = 180) -> str:
     if not clean:
         return ""
     return "\n".join(f"• {p}" for p in clean)
-
 
 # Transcript → pseudo turns
 def _parse_transcript_to_turns(
@@ -1304,7 +1301,6 @@ def google_stt_worker(
                 break
 
     asyncio.run_coroutine_threadsafe(out_q.put(None), loop)
-
 
 async def result_sender(
     websocket: WebSocket, out_q: "asyncio.Queue[Optional[dict]]", source: str
@@ -4735,6 +4731,8 @@ Rules:
 - The answer should work for both technical and non-technical candidates:
     use simple, clear language, and avoid heavy jargon.
 - Be supportive and neutral; do not sound judgmental.
+- always give complete full answers, DO NOT PROVIDE INCOMPLETE AND HALF ANSWERS.
+- write in point wise answers.
 
 Context:
 RESUME:
@@ -4780,6 +4778,12 @@ async def ai_validate(payload: Dict[str, str] = Body(...)):
         candidate_name=(meeting.get("candidate_name") or ""),
     )
 
+    lines = [
+        f"{(t.get('speaker_name') or t.get('speaker') or t.get('source'))}: {t.get('text', '')}"
+        for t in turns
+    ]
+    full_convo = "\n".join(lines)
+
     prompt = f"""
 You are evaluating a candidate's answer to an interview question.
 Return STRICT JSON with keys:
@@ -4799,26 +4803,45 @@ JD:
 QUESTION:
 {question}
 
-CANDIDATE_ANSWER:
-{cand_answer if cand_answer else "(none)"} 
+FULL_TRANSCRIPT:
+{full_convo}
+
+CANDIDATE_ANSWER (already extracted by the system from the transcript):
+{cand_answer if cand_answer else "(none)"}
 
 GUIDELINES:
 
 1) EXPECTED ANSWER:
-   - First infer a good expected_answer using JD + RESUME.
-   - Do NOT invent skills, tools, or experience that contradicts the RESUME.
+   - Base the expected_answer primarily on the QUESTION itself.
+   - Use JD + RESUME only to adjust which topics or technologies to emphasize,
+     but do NOT require the expected answer to mention specific projects, metrics,
+     or every single tool from the resume unless the question explicitly asks for that.
    - The expected_answer should be realistic for THIS candidate's background.
-   - Write complete response ,Do NOT write incomplete response. 
+   - Write a complete response. Do NOT write an incomplete sentence.
 
 2) VERDICT:
-   - "STRONG": Candidate answer is largely correct, relevant, and aligned with the expected_answer.
-   - "OK": Candidate answer is partially correct or high-level, but missing important details OR not very structured.
-   - "LIMITED": Candidate answer is very short, off-topic, clearly incorrect, or contradicts the resume/JD.
+   - "STRONG": Candidate answer is largely correct, relevant, and reasonably complete
+     for the QUESTION asked.
+   - "OK": Candidate answer is partially correct or high-level, but missing some important
+     details OR not very well structured.
+   - "LIMITED": Candidate answer is very short, off-topic, clearly incorrect,
+     or contradicts the resume/JD.
+
+   SPECIAL RULE FOR SIMPLE / DEFINITION QUESTIONS:
+   - For short conceptual/definition questions like "What is React?",
+     if the candidate gives a correct definition with the main idea and 1–2 relevant details,
+     treat this as STRONG, even if they don't mention JSX, hooks, lifecycle, or performance
+     optimizations, unless the question explicitly asked for a "detailed" or "in-depth" answer.
 
    VERY IMPORTANT:
-   - For broad questions like "Tell me about yourself" / "Introduce yourself" / "Walk me through your profile":
-     • If the answer is generally consistent with the resume and JD (even if brief), use at least "OK", not "LIMITED".
-     • Do NOT mark an answer as bad just because it doesn't repeat every project or metric from the resume.
+   - If CANDIDATE_ANSWER is NOT empty, you MUST NOT say that the candidate "did not provide any information"
+     or "gave no answer". You must at least acknowledge what they DID say, even if it was brief.
+   - For broad questions like "Tell me about yourself" / "Introduce yourself" /
+     "Walk me through your profile":
+     • If the answer is generally consistent with the resume and JD (even if brief),
+       use at least "OK", not "LIMITED".
+     • Do NOT mark an answer as bad just because it doesn't repeat every project or metric
+       from the resume.
      • Minor differences in phrasing or missing achievements are acceptable.
 
 3) SCORE:
@@ -4830,7 +4853,8 @@ GUIDELINES:
 
 4) TONE:
    - Be neutral, kind, and constructive.
-   - In the explanation, focus on what was good and what could be improved.
+   - In the explanation, briefly mention what was good and one area to improve.
+   - Do NOT list a long laundry list of missing topics.
    - Avoid harsh language like "wrong", "terrible", or personal judgments.
 
 Return ONLY the JSON object, with no extra commentary.
@@ -4859,18 +4883,18 @@ Return ONLY the JSON object, with no extra commentary.
     return {
         "session_id": session_id,
         "question": question,
-        "expected_answer": _to_bullets(exp_raw, max_items=6),
+        "expected_answer": _to_bullets(exp_raw, max_items=6,max_len=220),
         "candidate_answer": cand_answer,
         "verdict": verdict,          # STRONG / OK / LIMITED
         "score": score,
         "score_pct": score_pct,
-        "explanation": _to_bullets(explanation_raw, max_items=3, max_len=160),
+        "explanation": _to_bullets(explanation_raw, max_items=3, max_len=220),
     }
 
 @app.post("/ai/questions")
 async def ai_questions(payload: Dict[str, Any] = Body(...)):
     session_id = (payload or {}).get("session_id")
-    count = int((payload or {}).get("count", 5))
+    count = int((payload or {}).get("count", 3))
     if not session_id:
         raise HTTPException(400, "session_id required")
 
@@ -4881,10 +4905,29 @@ async def ai_questions(payload: Dict[str, Any] = Body(...)):
     convo = _turns_snippet(turns, 10)
 
     prompt = f"""
-Return STRICT JSON with key: questions (array of {count} concise follow-up questions).
-Use JD and Resume as primary guidance; if transcript context exists, adapt to it; otherwise generate from JD/Resume only.
-Keep tone neutral and helpful.
+You are helping a recruiter prepare follow-up questions AND example answers
+for THIS candidate.
 
+Return STRICT JSON with exactly one key: "items".
+
+"items" MUST be an array of objects. Each object MUST have:
+  - "question": string  (concise follow-up interview question)
+  - "answer":   string  (short 2 line example answer this candidate could realistically give)
+
+You MUST return up to 3 items (fewer only if it truly doesn't make sense).
+
+Rules for answers:
+- Use RESUME and RECENT TRANSCRIPT as the SINGLE source of truth about the candidate's background.
+- Do NOT invent tools, technologies, projects, or years of experience that contradict the RESUME.
+- If there is very little information about the candidate:
+    • Still write a helpful, realistic 2 line example answer
+      (for example, from the perspective of a fresher or early-career candidate),
+      instead of saying you cannot answer.
+- Use simple, clear language (no heavy jargon).
+- Be neutral, supportive, and non-judgmental.
+- Do NOT leave "answer" empty or null for any item.
+
+Context:
 RESUME:
 {resume}
 
@@ -4893,15 +4936,61 @@ JD:
 
 RECENT TRANSCRIPT:
 {convo if convo.strip() else "(none)"}
+
+Return ONLY JSON, no code fences, no markdown, no extra text.
+Expected shape:
+{{ "items": [{{"question":"...","answer":"..."}}, ...] }}
 """.strip()
 
-    data = _ollama_chat_json(prompt, temperature=0.6)
-    questions = data.get("questions")
-    if not isinstance(questions, list):
+    data = _ollama_chat_json(prompt, temperature=0.5)
+
+    items = data.get("items") or []
+
+    questions: List[str] = []
+    answers: List[str] = []
+
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            q = str(item.get("question") or "").strip()
+            a_raw = str(
+                item.get("answer")
+                or item.get("expected_answer")
+                or ""
+            ).strip()
+
+            if not q:
+                continue
+
+            # format the answer nicely into bullets, but don't let it become empty
+            formatted = _to_bullets(a_raw, max_items=6)
+            if not formatted:
+                formatted = a_raw or "Example answer could highlight one concrete experience and connect it to this role."
+
+            questions.append(q)
+            answers.append(formatted)
+
+    # Hard fallback: if the model didn't follow the spec at all
+    if not questions:
         raw = (data.get("raw") or "").strip()
-        questions = [x.strip("-• ").strip() for x in raw.split("\n") if x.strip()]
-    questions = [q for q in questions if q][:count]
-    return {"session_id": session_id, "questions": questions}
+        if raw:
+            # naive fallback: split lines as questions, generic placeholder answers
+            lines = [x.strip("-• ").strip() for x in raw.split("\n") if x.strip()]
+            for line in lines[:count]:
+                questions.append(line)
+                answers.append("You can answer this by briefly describing a relevant situation, what you did, and the outcome.")
+
+    # Trim to requested count, keep arrays aligned
+    n = min(len(questions), len(answers), count)
+    questions = questions[:n]
+    answers = answers[:n]
+
+    return {
+        "session_id": session_id,
+        "questions": questions,
+        "answers": answers,
+    }
 
 @app.post("/recruiter/interviews/{interview_id}/email/hired")
 async def send_hired_email(
