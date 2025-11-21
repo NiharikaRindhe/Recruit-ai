@@ -1151,20 +1151,24 @@ def _to_bullets(s: str, max_items: int = 6, max_len: int = 180) -> str:
     s = _strip_code_and_json(s)
     if not s:
         return ""
+    # Split by newlines or bullets
     parts = re.split(r"[\r\n]+|(?:^|[\s])[-–•·]\s+", s)
     parts = [p.strip(" -–•\t\r\n") for p in parts if p and p.strip()]
+    
+    # If regex didn't find bullets, split by sentence boundaries roughly
     if len(parts) <= 1:
         parts = re.split(r"(?<=[.!?])\s+", s)
+
     clean = []
     for p in parts:
         p = re.sub(r"\s+", " ", p).strip()
         if not p:
             continue
-        if len(p) > max_len:
-            p = p[: max_len - 1].rstrip() + "…"
+        # CHANGED: Removed the truncation logic (p[:max_len]...) to prevent incomplete sentences
         clean.append(p)
         if len(clean) >= max_items:
             break
+            
     if not clean:
         return ""
     return "\n".join(f"• {p}" for p in clean)
@@ -1317,12 +1321,6 @@ async def result_sender(
             break
 
 def _recent_turns(session_id: str, limit: int = 2000) -> list[dict]:
-    """
-    Load the meeting transcript from Supabase and convert it into
-    pseudo-turns (speaker + text) using _parse_transcript_to_turns.
-    The 'limit' is a soft cap on number of characters; you can
-    adjust if you want.
-    """
     mtg = _sb_get_meeting(session_id)
     if not mtg:
         return []
@@ -1331,9 +1329,8 @@ def _recent_turns(session_id: str, limit: int = 2000) -> list[dict]:
     interviewer_name = mtg.get("interviewer_name") or ""
     candidate_name = mtg.get("candidate_name") or ""
 
-    # If transcript is very long, truncate from the end (most recent lines)
-    if len(transcript) > limit:
-        # keep last `limit` chars
+    # CHANGED: If limit is 0, return the full transcript (needed for validation search)
+    if limit > 0 and len(transcript) > limit:
         transcript = transcript[-limit:]
 
     return _parse_transcript_to_turns(
@@ -4714,50 +4711,45 @@ async def ai_expected(payload: Dict[str, str] = Body(...)):
     meeting = _sb_get_meeting(session_id)
     resume = meeting.get("resume", "")
     jd = meeting.get("jd", "")
-    turns = _recent_turns(session_id, 80)
+    
+    # Only need recent context to understand if there are specific constraints
+    turns = _recent_turns(session_id, limit=2000) 
     convo = _turns_snippet(turns, 12)
 
     prompt = f"""
-You are generating an example answer to help THIS candidate improve.
-Return STRICT JSON with exactly one key: expected_answer.
+You are generating an Expected Answer for the interviewer. 
+The interviewer asked: "{question}"
 
-Rules:
-- Use RESUME and RECENT TRANSCRIPT as the SINGLE source of truth about the candidate's background and skills.
-- Do NOT invent technical skills, tools, projects, or years of experience that are not clearly present in the RESUME or mentioned by the candidate.
-- Use the JD only to decide what to emphasize and how to structure the answer, but keep the content honest and realistic for THIS candidate.
-- If the JD asks for skills that the candidate does not have, you may:
-    • Mention genuine interest in learning those areas, OR
-    • Highlight transferable skills from their real experience,
-  but you MUST NOT pretend they already have that experience.
-- The answer should work for both technical and non-technical candidates:
-    use simple, clear language, and avoid heavy jargon.
-- Be supportive and neutral; do not sound judgmental.
-- always give complete full answers, DO NOT PROVIDE INCOMPLETE AND HALF ANSWERS.
-- write in point wise answers.
+Return STRICT JSON with exactly one key: "expected_answer".
 
-Context:
+Instructions:
+1. Analyze the JD to see what requirements this question relates to.
+2. Analyze the RESUME to see if the candidate has relevant skills/projects.
+3. Construct a point-wise answer that bridges the JD requirements with the Candidate's Resume.
+   - e.g. "According to the JD, knowledge of X is needed... Based on the Resume, the candidate can mention project Y..."
+4. CRITICAL: Write complete, grammatically correct sentences. Do not use "..." or trail off. 
+5. Provide 3-4 concise bullet points.
+
 RESUME:
 {resume}
 
 JD:
 {jd}
 
-RECENT TRANSCRIPT:
+RECENT CONTEXT:
 {convo}
 
-QUESTION TO PREPARE EXPECTED ANSWER FOR:
+QUESTION:
 {question}
-
-Write a concise but complete expected_answer (bullets or short paragraphs)
-that THIS candidate could realistically say based on their real background.
 """.strip()
 
     data = _ollama_chat_json(prompt)
     exp_raw = (data.get("expected_answer") or data.get("raw") or "").strip()
+    
     return {
         "session_id": session_id,
         "question": question,
-        "expected_answer": _to_bullets(exp_raw, max_items=6),
+        "expected_answer": _to_bullets(exp_raw, max_items=4),
     }
 
 @app.post("/ai/validate")
@@ -4770,126 +4762,100 @@ async def ai_validate(payload: Dict[str, str] = Body(...)):
     meeting = _sb_get_meeting(session_id)
     resume = meeting.get("resume", "")
     jd = meeting.get("jd", "")
-    turns = _recent_turns(session_id, 300)
+    
+    # CHANGED: Fetch ALL turns (limit=0) to search for the question
+    turns = _recent_turns(session_id, limit=0) 
+    
+    # Logic: Find the index of the question in the transcript
+    target_idx = -1
+    q_norm = _norm(question)
+    
+    # Search backwards to find the most recent occurrence
+    for i in range(len(turns) - 1, -1, -1):
+        t_text = _norm(turns[i].get("text", ""))
+        # Fuzzy match: if a significant part of the question is in the turn
+        if q_norm in t_text or t_text in q_norm or (len(q_norm) > 10 and q_norm[:20] in t_text):
+            target_idx = i
+            break
+            
+    context_turns = []
+    if target_idx != -1:
+        # Slice: 7 turns BEFORE and 7 turns AFTER the question
+        start_i = max(0, target_idx - 7)
+        end_i = min(len(turns), target_idx + 8) 
+        context_turns = turns[start_i:end_i]
+    else:
+        # Fallback if exact question not found: take last 15 turns
+        context_turns = turns[-15:]
 
-    cand_answer = _extract_candidate_answer(
-        question,
-        turns,
-        interviewer_name=(meeting.get("interviewer_name") or ""),
-        candidate_name=(meeting.get("candidate_name") or ""),
-    )
-
+    # Format transcript window for LLM
     lines = [
         f"{(t.get('speaker_name') or t.get('speaker') or t.get('source'))}: {t.get('text', '')}"
-        for t in turns
+        for t in context_turns
     ]
-    full_convo = "\n".join(lines)
+    transcript_window = "\n".join(lines)
 
     prompt = f"""
-You are evaluating a candidate's answer to an interview question.
-Return STRICT JSON with keys:
-- verdict (one of: "STRONG", "OK", "LIMITED")
-- score (0.0–1.0)
-- explanation (1–3 short sentences)
-- expected_answer
-- candidate_answer
+You are validating a candidate's answer. 
+Return STRICT JSON with keys: "verdict", "explanation".
 
-Use:
-RESUME:
-{resume}
+INPUTS:
+- Question asked: "{question}"
+- Context: Transcript window (7 turns before/after question).
 
-JD:
-{jd}
+VERDICT RULES:
+- "STRONG": The candidate answered the question properly and completely.
+- "OK": The candidate gave an incomplete answer or only half-matched the requirement.
+- "LIMITED": The candidate did not answer, gave a wrong answer, or the answer is irrelevant.
 
-QUESTION:
-{question}
-
-FULL_TRANSCRIPT:
-{full_convo}
-
-CANDIDATE_ANSWER (already extracted by the system from the transcript):
-{cand_answer if cand_answer else "(none)"}
-
-GUIDELINES:
-
-1) EXPECTED ANSWER:
-   - Base the expected_answer primarily on the QUESTION itself.
-   - Use JD + RESUME only to adjust which topics or technologies to emphasize,
-     but do NOT require the expected answer to mention specific projects, metrics,
-     or every single tool from the resume unless the question explicitly asks for that.
-   - The expected_answer should be realistic for THIS candidate's background.
-   - Write a complete response. Do NOT write an incomplete sentence.
-
-2) VERDICT:
-   - "STRONG": Candidate answer is largely correct, relevant, and reasonably complete
-     for the QUESTION asked.
-   - "OK": Candidate answer is partially correct or high-level, but missing some important
-     details OR not very well structured.
-   - "LIMITED": Candidate answer is very short, off-topic, clearly incorrect,
-     or contradicts the resume/JD.
-
-   SPECIAL RULE FOR SIMPLE / DEFINITION QUESTIONS:
-   - For short conceptual/definition questions like "What is React?",
-     if the candidate gives a correct definition with the main idea and 1–2 relevant details,
-     treat this as STRONG, even if they don't mention JSX, hooks, lifecycle, or performance
-     optimizations, unless the question explicitly asked for a "detailed" or "in-depth" answer.
-
-   VERY IMPORTANT:
-   - If CANDIDATE_ANSWER is NOT empty, you MUST NOT say that the candidate "did not provide any information"
-     or "gave no answer". You must at least acknowledge what they DID say, even if it was brief.
-   - For broad questions like "Tell me about yourself" / "Introduce yourself" /
-     "Walk me through your profile":
-     • If the answer is generally consistent with the resume and JD (even if brief),
-       use at least "OK", not "LIMITED".
-     • Do NOT mark an answer as bad just because it doesn't repeat every project or metric
-       from the resume.
-     • Minor differences in phrasing or missing achievements are acceptable.
-
-3) SCORE:
+MATCH THIS SCORE WITH VERDICT:
    - score is a float between 0.0 and 1.0.
    - Rough guideline:
      • STRONG  → score between 0.7 and 1.0
      • OK      → score between 0.4 and 0.7
      • LIMITED → score between 0.0 and 0.4
 
-4) TONE:
+TONE:
    - Be neutral, kind, and constructive.
    - In the explanation, briefly mention what was good and one area to improve.
    - Do NOT list a long laundry list of missing topics.
    - Avoid harsh language like "wrong", "terrible", or personal judgments.
 
-Return ONLY the JSON object, with no extra commentary.
+EXPLANATION RULES:
+- Write 2-3 complete sentences explaining the verdict. 
+- Do not cut off sentences.
+
+RESUME:
+{resume}
+
+JD:
+{jd}
+
+TRANSCRIPT WINDOW:
+{transcript_window}
 """.strip()
 
     data = _ollama_chat_json(prompt)
 
-    # Softer verdict labels
     verdict = (data.get("verdict") or "").upper().strip()
-    allowed_verdicts = {"STRONG", "OK", "LIMITED"}
-    if verdict not in allowed_verdicts:
-        # Fallback: if there is no candidate answer at all, LIMITED; otherwise OK
-        verdict = "LIMITED" if not cand_answer else "OK"
+    
+    # Normalize verdict to your requested set
+    if "ALMOST" in verdict or "STRONG" in verdict: 
+        verdict = "ALMOST"
+    elif "OK" in verdict: 
+        verdict = "OK"
+    else: 
+        verdict = "LIMITED"
 
-    try:
-        score = float(data.get("score", 0.0))
-    except Exception:
-        score = 0.0
-    # Clamp score into [0.0, 1.0]
-    score = max(0.0, min(1.0, score))
-    score_pct = int(round(score * 100))
-
-    exp_raw = (data.get("expected_answer") or data.get("raw") or "").strip()
     explanation_raw = (data.get("explanation") or data.get("raw") or "").strip()
 
     return {
         "session_id": session_id,
         "question": question,
-        "expected_answer": _to_bullets(exp_raw, max_items=6,max_len=220),
-        "candidate_answer": cand_answer,
-        "verdict": verdict,          # STRONG / OK / LIMITED
-        "score": score,
-        "score_pct": score_pct,
-        "explanation": _to_bullets(explanation_raw, max_items=3, max_len=220),
+        "verdict": verdict,
+        "explanation": _to_bullets(explanation_raw, max_items=3),
+        # We return the window used so you can debug if needed
+        "transcript_window_used": transcript_window
     }
 
 @app.post("/ai/questions")
@@ -4902,31 +4868,21 @@ async def ai_questions(payload: Dict[str, Any] = Body(...)):
     meeting = _sb_get_meeting(session_id)
     resume = meeting.get("resume", "")
     jd = meeting.get("jd", "")
-    turns = _recent_turns(session_id, 60)
+    
+    # Get enough context for "flow"
+    turns = _recent_turns(session_id, limit=2000)
     convo = _turns_snippet(turns, 10)
 
     prompt = f"""
-You are helping a recruiter prepare follow-up questions AND example answers
-for THIS candidate.
+You are suggesting follow-up interview questions.
+Return STRICT JSON with key: "items" (array of objects with "question" and "answer").
 
-Return STRICT JSON with exactly one key: "items".
-
-"items" MUST be an array of objects. Each object MUST have:
-  - "question": string  (concise follow-up interview question)
-  - "answer":   string  (short 2 line example answer this candidate could realistically give)
-
-You MUST return up to 3 items (fewer only if it truly doesn't make sense).
-
-Rules for answers:
-- Use RESUME and RECENT TRANSCRIPT as the SINGLE source of truth about the candidate's background.
-- Do NOT invent tools, technologies, projects, or years of experience that contradict the RESUME.
-- If there is very little information about the candidate:
-    • Still write a helpful, realistic 2 line example answer
-      (for example, from the perspective of a fresher or early-career candidate),
-      instead of saying you cannot answer.
-- Use simple, clear language (no heavy jargon).
-- Be neutral, supportive, and non-judgmental.
-- Do NOT leave "answer" empty or null for any item.
+RULES:
+1. Questions must follow the FLOW of the current conversation (Context).
+2. Questions must relate to the JD and Resume.
+3. "answer": Provide a suggested answer for the candidate.
+   - This must be point-wise.
+   - CRITICAL: Use COMPLETE sentences. Do not leave sentences incomplete.
 
 Context:
 RESUME:
@@ -4935,62 +4891,39 @@ RESUME:
 JD:
 {jd}
 
-RECENT TRANSCRIPT:
-{convo if convo.strip() else "(none)"}
+CURRENT CONVERSATION:
+{convo}
 
-Return ONLY JSON, no code fences, no markdown, no extra text.
-Expected shape:
-{{ "items": [{{"question":"...","answer":"..."}}, ...] }}
+Return JSON with exactly 3 items: {{ "items": [{{"question":"...","answer":"..."}}] }}
 """.strip()
 
-    data = _ollama_chat_json(prompt, temperature=0.5)
+    data = _ollama_chat_json(prompt, temperature=0.4)
 
     items = data.get("items") or []
-
-    questions: List[str] = []
-    answers: List[str] = []
+    questions = []
+    answers = []
 
     if isinstance(items, list):
         for item in items:
-            if not isinstance(item, dict):
-                continue
+            if not isinstance(item, dict): continue
             q = str(item.get("question") or "").strip()
-            a_raw = str(
-                item.get("answer")
-                or item.get("expected_answer")
-                or ""
-            ).strip()
+            a_raw = str(item.get("answer") or "").strip()
+            
+            if q and a_raw:
+                questions.append(q)
+                # Format answer cleanly
+                answers.append(_to_bullets(a_raw, max_items=3))
 
-            if not q:
-                continue
-
-            # format the answer nicely into bullets, but don't let it become empty
-            formatted = _to_bullets(a_raw, max_items=6)
-            if not formatted:
-                formatted = a_raw or "Example answer could highlight one concrete experience and connect it to this role."
-
-            questions.append(q)
-            answers.append(formatted)
-
-    # Hard fallback: if the model didn't follow the spec at all
+    # Fallback if empty or malformed
     if not questions:
-        raw = (data.get("raw") or "").strip()
-        if raw:
-            # naive fallback: split lines as questions, generic placeholder answers
-            lines = [x.strip("-• ").strip() for x in raw.split("\n") if x.strip()]
-            for line in lines[:count]:
-                questions.append(line)
-                answers.append("You can answer this by briefly describing a relevant situation, what you did, and the outcome.")
+        questions = ["Could you elaborate on your recent project?", "How does your experience align with this role?", "What is your preferred tech stack?"]
+        answers = ["Candidate should describe project scope and impact.", "Candidate should map skills to JD requirements.", "Candidate should explain their tool choices."]
 
-    # Trim to requested count, keep arrays aligned
     n = min(len(questions), len(answers), count)
-    questions = questions[:n]
-    answers = answers[:n]
-
     return {
         "session_id": session_id,
-        "questions": questions,
-        "answers": answers,
+        "questions": questions[:n],
+        "answers": answers[:n],
     }
 
 @app.post("/recruiter/interviews/{interview_id}/email/hired")
