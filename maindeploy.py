@@ -544,34 +544,35 @@ def _extract_skills(block: str) -> List[str]:
     return out
 
 def _extract_fields_from_jd_text(jd_text: str) -> Dict[str, Any]:
-    """Very small heuristic parser for a pasted JD."""
+    """
+    Hybrid JD parser:
+      1) Run old heuristic parsing (regex-based).
+      2) Run AI parser (parse_jd_with_ai).
+      3) Merge: prefer AI where it's confident, fall back to heuristic.
+    """
     text = jd_text.strip()
 
-    # title: first sentence or "Senior X at Y"
+    # ---------- 1) OLD HEURISTIC LOGIC (your existing code) ----------
     title = None
     m = re.search(r"(?i)^(?:we\s+are\s+looking\s+for\s+a|hiring\s+a|role:)?\s*([A-Z][\w\s\/\-\+]{4,50})", text)
     if m:
         title = m.group(1).strip(" .,")
 
-    # company
     company = None
     m = re.search(r"(?i)(?:at|@)\s+([A-Z][\w\s\.\-&]{2,60})", text)
     if m:
         company = m.group(1).strip(" .,")
 
-    # location
     location = None
     m = re.search(r"(?i)location\s*[:\-]\s*([^\n\.]+)", text)
     if m:
         location = m.group(1).strip()
 
-    # employment
     employment = None
     m = re.search(r"(?i)(employment|type)\s*[:\-]\s*([^\n\.]+)", text)
     if m:
         employment = m.group(2).strip()
 
-    # work mode
     work_mode = None
     m = re.search(r"(?i)work\s*mode\s*[:\-]\s*([^\n\.]+)", text)
     if m:
@@ -585,14 +586,15 @@ def _extract_fields_from_jd_text(jd_text: str) -> Dict[str, Any]:
         elif re.search(r"(?i)\b(?:onsite|on-site|office)\b", text):
             work_mode = "onsite"
 
-    # experience
     min_exp = None
     max_exp = None
     m = re.search(r"(?i)(\d+)\+?\s*(?:years|yrs)\s+of\s+experience", text)
     if m:
-        min_exp = float(m.group(1))
+        try:
+            min_exp = float(m.group(1))
+        except Exception:
+            min_exp = None
 
-    # must have / nice to have
     must = []
     nice = []
 
@@ -604,7 +606,7 @@ def _extract_fields_from_jd_text(jd_text: str) -> Dict[str, Any]:
     if m:
         nice = _extract_skills(m.group(1))
 
-    return {
+    heuristic = {
         "job_title": title,
         "company_name": company,
         "location": location,
@@ -616,6 +618,50 @@ def _extract_fields_from_jd_text(jd_text: str) -> Dict[str, Any]:
         "skills_nice_to_have": nice,
         "jd_text": text,
     }
+
+    # ---------- 2) AI PARSER (best-effort) ----------
+    ai = {}
+    try:
+        ai = parse_jd_with_ai(text)
+    except Exception:
+        ai = {}
+
+    def pick(*values):
+        """Return first non-empty / non-null value."""
+        for v in values:
+            if v is None:
+                continue
+            if isinstance(v, str) and not v.strip():
+                continue
+            if isinstance(v, (list, dict)) and not v:
+                continue
+            return v
+        return None
+
+    # numbers: prefer AI if it returned a number
+    def pick_num(ai_val, base_val):
+        if isinstance(ai_val, (int, float)):
+            return float(ai_val)
+        return base_val
+
+    skills_must = pick(ai.get("skills_must_have"), heuristic.get("skills_must_have")) or []
+    skills_nice = pick(ai.get("skills_nice_to_have"), heuristic.get("skills_nice_to_have")) or []
+
+    result = {
+        "job_title": pick(ai.get("job_title"), heuristic.get("job_title")),
+        "company_name": pick(ai.get("company_name"), heuristic.get("company_name")),
+        "location": pick(ai.get("location"), heuristic.get("location")),
+        "employment_type": pick(ai.get("employment_type"), heuristic.get("employment_type")),
+        "work_mode": pick(ai.get("work_mode"), heuristic.get("work_mode")),
+        "min_experience": pick_num(ai.get("min_experience"), heuristic.get("min_experience")),
+        "max_experience": pick_num(ai.get("max_experience"), heuristic.get("max_experience")),
+        "skills_must_have": skills_must,
+        "skills_nice_to_have": skills_nice,
+        # keep full text
+        "jd_text": text,
+    }
+
+    return result
 
 def _detect_missing_fields(parsed: Dict[str, Any]) -> List[Dict[str, str]]:
     """Return a list of questions we should ask the recruiter."""
@@ -2384,7 +2430,72 @@ def _ollama_generate(prompt: str) -> str:
     return generate_jd_with_ollama(prompt)
 
 # Prompts
-ALLOWED_RESUME_STATUSES = {"PENDING", "PARSED", "REJECTED","SHORTLISTED","INTERVIEW_SCHEDULED"}
+
+# --- JD parsing via AI (LLM) ---
+
+JD_PARSE_PROMPT = """
+You are a job description (JD) parsing assistant.
+
+Return ONLY a JSON object with EXACTLY these top-level keys:
+- job_title          (string or null)
+- company_name       (string or null)
+- location           (string or null)
+- employment_type    (string or null, e.g. "Full-time", "Part-time", "Contract", "Internship")
+- work_mode          (string or null, e.g. "remote", "onsite", "hybrid")
+- min_experience     (number of years, float or null)
+- max_experience     (number of years, float or null)
+- skills_must_have   (array of strings)
+- skills_nice_to_have(array of strings)
+- requirements       (string or null; free text of main requirements / responsibilities)
+
+Rules:
+- If the JD does not clearly specify something, set that field to null instead of guessing.
+- skills_must_have: technologies / skills that appear as mandatory, required, or core.
+- skills_nice_to_have: technologies / skills marked as "nice to have", "good to have", or optional.
+- min_experience / max_experience:
+    - If range given like "3-5 years", min_experience=3, max_experience=5.
+    - If "3+ years", min_experience=3, max_experience=null.
+    - If not specified, use null for both.
+- work_mode:
+    - "remote" / "onsite" / "hybrid" if explicitly stated.
+    - Otherwise null.
+- employment_type:
+    - "Full-time", "Part-time", "Contract", or "Internship" if the JD clearly states that.
+    - Otherwise null.
+
+Do NOT include any comments or explanations. Return ONLY the JSON.
+
+JD TEXT:
+{jd_text}
+""".strip()
+
+
+def _ensure_list_of_str(value) -> list[str]:
+    """
+    Normalize skills lists from the model:
+    - list → trim each string
+    - string → split on commas / newlines / semicolons / bullets
+    """
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+    if isinstance(value, str):
+        parts = re.split(r"[,;/\n•\-]+", value)
+        return [p.strip() for p in parts if p.strip()]
+    return []
+
+ALLOWED_RESUME_STATUSES = {
+    "PENDING",
+    "PARSED",
+    "SHORTLISTED",
+    "INTERVIEW_SCHEDULED",
+    "INTERVIEW_DONE",
+    "REVIEW",
+    "SELECTED",
+    "REJECTED",
+    "HIRED",
+    "ABSENT",
+    "CANCELLED",
+}
 
 EXTRACT_PROMPT = (
     "You are a resume parsing assistant. Return ONLY JSON with these exact top-level keys: "
@@ -2440,6 +2551,24 @@ CANDIDATE (parsed & truncated):
 
 Only use information present above. Be specific, avoid fluff. Keep total under ~250 words.
 """.strip()
+
+def _update_resume_status(resume_id: Optional[str], new_status: str) -> None:
+    """
+    Safely update the status of a resume row.
+    - No-op if resume_id is None.
+    - Ignores statuses not in ALLOWED_RESUME_STATUSES (to avoid typos).
+    """
+    if not resume_id:
+        return
+    if new_status not in ALLOWED_RESUME_STATUSES:
+        return
+
+    try:
+        supabase.table("resumes").update({"status": new_status}).eq(
+            "resume_id", resume_id
+        ).execute()
+    except Exception as e:
+        print(f"[resume_status] failed to update for {resume_id}: {e}")
 
 def generate_resume_analysis(
     candidate: dict,
@@ -2816,6 +2945,65 @@ def _ensure_company(user: UserIdentity) -> Dict[str, Any]:
 
     return rec
 
+def parse_jd_with_ai(jd_text: str) -> Dict[str, Any]:
+    """
+    Best-effort JD parser using the LLM.
+    Returns a dict with the expected keys, or {} if anything goes wrong.
+    """
+    from fastapi import HTTPException  # already imported at top, but safe
+
+    if not jd_text or not jd_text.strip():
+        return {}
+
+    prompt = JD_PARSE_PROMPT.format(jd_text=jd_text[:8000])
+
+    try:
+        data = _ollama_json(prompt)  # uses your existing Ollama JSON helper
+    except HTTPException:
+        return {}
+    except Exception:
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    # Ensure all expected keys exist with safe defaults
+    job_title       = (data.get("job_title") or "").strip() or None
+    company_name    = (data.get("company_name") or "").strip() or None
+    location        = (data.get("location") or "").strip() or None
+    employment_type = (data.get("employment_type") or "").strip() or None
+    work_mode       = (data.get("work_mode") or "").strip() or None
+
+    def _to_float_or_none(x):
+        try:
+            if x is None:
+                return None
+            f = float(x)
+            return f
+        except Exception:
+            return None
+
+    min_experience = _to_float_or_none(data.get("min_experience"))
+    max_experience = _to_float_or_none(data.get("max_experience"))
+
+    skills_must = _ensure_list_of_str(data.get("skills_must_have"))
+    skills_nice = _ensure_list_of_str(data.get("skills_nice_to_have"))
+
+    requirements = (data.get("requirements") or "").strip() or None
+
+    return {
+        "job_title": job_title,
+        "company_name": company_name,
+        "location": location,
+        "employment_type": employment_type,
+        "work_mode": work_mode,
+        "min_experience": min_experience,
+        "max_experience": max_experience,
+        "skills_must_have": skills_must,
+        "skills_nice_to_have": skills_nice,
+        "requirements": requirements,
+    }
+
 @app.get("/jobs/{job_id}/ranked")
 async def ranked(job_id: str, limit: int = Query(50, ge=1, le=200), current_user: UserIdentity = Depends(get_current_user)):
     _ = _get_job_owned(job_id, current_user)  # verify ownership
@@ -2861,7 +3049,15 @@ async def recruiter_candidates_ranked(
     resume_ids = [r["resume_id"] for r in resumes]
 
     # Only consider these interview statuses
-    RANKABLE_STATUSES = ["INTERVIEW_SCHEDULED", "INTERVIEW_DONE", "ABSENT"]
+    RANKABLE_STATUSES = [
+        "INTERVIEW_SCHEDULED",
+        "INTERVIEW_DONE",
+        "ABSENT",
+        "REVIEW",
+        "SELECTED",
+        "REJECTED",
+        "HIRED",
+    ]
 
     # 2) Interviews for those resumes, filtered by status
     interviews = (
@@ -4168,14 +4364,51 @@ class InterviewStatusIn(BaseModel):
     status: str  # validate against the enum in code too
 
 @app.post("/interviews/{interview_id}/status")
-async def update_interview_status(interview_id: str, body: InterviewStatusIn,
-                                  current_user: UserIdentity = Depends(get_current_user)):
-    allowed = {"INTERVIEW_SCHEDULED","INTERVIEW_DONE","SELECTED","REJECTED","REVIEW","HIRED","ABSENT","CANCELLED"}
+async def update_interview_status(
+    interview_id: str,
+    body: InterviewStatusIn,
+    current_user: UserIdentity = Depends(get_current_user),
+):
+    allowed = {
+        "INTERVIEW_SCHEDULED",
+        "INTERVIEW_DONE",
+        "SELECTED",
+        "REJECTED",
+        "REVIEW",
+        "HIRED",
+        "ABSENT",
+        "CANCELLED",
+    }
     if body.status not in allowed:
         raise HTTPException(400, "Invalid status")
-    row = supabase.table("interviews").update({"status": body.status}).eq("interview_id", interview_id).execute().data
-    if not row:
+
+    resp = (
+        supabase.table("interviews")
+        .update({"status": body.status})
+        .eq("interview_id", interview_id)
+        .execute()
+    )
+    rows = resp.data or []
+    if not rows:
         raise HTTPException(404, "Interview not found")
+
+    updated_row = rows[0]
+
+    # 🔥 Sync resume status for pipeline-relevant states
+    # (You can adjust this set if you don't want all to show up on resumes)
+    if body.status in {
+        "INTERVIEW_SCHEDULED",
+        "INTERVIEW_DONE",
+        "REVIEW",
+        "SELECTED",
+        "REJECTED",
+        "HIRED",
+        "ABSENT",
+        "CANCELLED",
+    }:
+        resume_id = updated_row.get("resume_id")
+        _update_resume_status(resume_id, body.status)
+
     return {"interview_id": interview_id, "status": body.status}
 
 @app.post("/recruiter/interviews/{interview_id}/decision")
@@ -4192,7 +4425,7 @@ async def recruiter_set_decision(
     # 1) Fetch interview
     interview = _first_row(
         supabase.table("interviews")
-        .select("interview_id, job_id, status, recruiter_note")
+        .select("interview_id, job_id, resume_id, status, recruiter_note")  # 👈 added resume_id
         .eq("interview_id", interview_id)
         .limit(1)
         .execute()
@@ -4217,6 +4450,10 @@ async def recruiter_set_decision(
     )
     if not updated:
         raise HTTPException(404, "Interview not found after update")
+
+    # 4) 🔥 KEEP RESUME IN SYNC
+    resume_id = interview.get("resume_id")
+    _update_resume_status(resume_id, body.status)
 
     return {
         "interview_id": interview_id,
